@@ -1,0 +1,185 @@
+# Environment Directors Configuration
+# Configuration for the modular environment director system
+
+# Global ToolHub settings
+toolhub:
+  startup_hooks: true
+  shutdown_hooks: true
+  security_check_interval: 300  # seconds
+  log_level: INFO
+
+# Permissions Director Configuration
+permissions:
+  rules:
+    "/etc/passwd": "644"
+    "/etc/shadow": "600"
+    "/etc/sudoers": "440"
+    "/root": "700"
+    "/tmp": "1777"
+  critical_paths:
+    - "/etc/passwd"
+    - "/etc/shadow"
+    - "/etc/hosts"
+    - "/etc/sudoers"
+    - "~/.ssh/authorized_keys"
+    - "~/.bashrc"
+  world_writable_scan_limit: 1000
+  auto_fix_permissions: false
+
+# Symlink Director Configuration  
+symlink:
+  maxDepth: 5
+  allowedTargets:
+    - "/usr/local/*"
+    - "/opt/*" 
+    - "/home/*/bin/*"
+  protectedPaths:
+    - "/etc"
+    - "/root"
+    - "/usr/bin"
+    - "/usr/sbin" 
+  scan_directories:
+    - "/tmp"
+    - "/var/tmp"
+    - "~/"
+  auto_remove_malicious: false
+
+# File Security Director Configuration
+file_security:
+  quarantine_dir: "~/.quarantine"
+  critical_files:
+    - "/etc/passwd"
+    - "/etc/shadow"
+    - "/etc/hosts"
+    - "~/.ssh/authorized_keys"
+  monitored_directories:
+    - "/tmp"
+    - "/var/tmp"
+    - "~/"
+    - "/usr/local/bin"
+  suspicious_extensions:
+    - ".exe"
+    - ".scr" 
+    - ".bat"
+    - ".cmd"
+    - ".vbs"
+    - ".ps1"
+  scan_size_limit: 10485760  # 10MB
+  integrity_check_interval: 3600  # 1 hour
+  auto_quarantine: false
+
+# Memory Director Configuration
+memory:
+  maxHeapUsagePercent: 85
+  maxNonHeapUsagePercent: 90
+  cleanupIntervalMinutes: 5
+  historyRetentionHours: 24
+  memory_leak_threshold: 0.95
+  auto_cleanup_threshold: 0.9
+  monitoring_enabled: true
+  track_allocations: true
+
+# Integration Settings
+integration:
+  android:
+    enabled: false
+    package_name: "com.example.dolphinmistral"
+    security_level: "high"
+    permissions_required:
+      - "android.permission.READ_EXTERNAL_STORAGE"
+      - "android.permission.WRITE_EXTERNAL_STORAGE"
+  
+  python:
+    enabled: true
+    virtual_env: null  # Use system Python if null
+    requirements_check: true
+    security_modules:
+      - "file_security"
+      - "network_security"
+  
+  api:
+    enabled: true
+    port: 8080
+    authentication: "token"
+    rate_limit: 100  # requests per minute
+
+# Logging Configuration
+logging:
+  level: INFO
+  file: "env-directors.log"
+  max_size: "10MB"
+  backup_count: 5
+  format: "[{timestamp}] [{level}] [{director}] {message}"
+
+# Security Policies
+security:
+  default_deny: true
+  alert_threshold: "WARN"
+  auto_remediation: false
+  notification_webhook: null
+  emergency_shutdown: false
+  
+  policies:
+    - name: "critical_file_integrity"
+      enabled: true
+      action: "alert"
+      severity: "high"
+    
+    - name: "malicious_symlink_detection"
+      enabled: true
+      action: "quarantine"
+      severity: "critical"
+    
+    - name: "memory_exhaustion_prevention"
+      enabled: true
+      action: "cleanup"
+      severity: "medium"
+    
+    - name: "permission_violation_detection"
+      enabled: true
+      action: "alert"
+      severity: "high"
+
+# Environment Profiles
+profiles:
+  development:
+    security:
+      auto_remediation: false
+      alert_threshold: "WARN"
+    permissions:
+      auto_fix_permissions: false
+    memory:
+      maxHeapUsagePercent: 90
+    
+  production:
+    security:
+      auto_remediation: true
+      alert_threshold: "WARN"  
+    permissions:
+      auto_fix_permissions: true
+    memory:
+      maxHeapUsagePercent: 80
+    file_security:
+      auto_quarantine: true
+    
+  hardened:
+    security:
+      default_deny: true
+      auto_remediation: true
+      alert_threshold: "INFO"
+      emergency_shutdown: true
+    permissions:
+      auto_fix_permissions: true
+    symlink:
+      auto_remove_malicious: true
+    file_security:
+      auto_quarantine: true
+    memory:
+      maxHeapUsagePercent: 75
+
+# Director Load Order
+load_order:
+  - "PermissionsDirector"
+  - "SymlinkDirector" 
+  - "FileSecurityDirector"
+  - "MemoryDirector"
