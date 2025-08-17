@@ -1,0 +1,7 @@
+echo "# dolphin-mistral-codespace" >> README.md
+git init
+git add README.md
+git commit -m "first commit"
+git branch -M atonomous-agency
+git remote add origin https://github.com/spiralgang/dolphin-mistral-codespace.git
+git push -u origin atonomous-agency
