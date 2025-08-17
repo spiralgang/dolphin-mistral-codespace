@@ -1,0 +1,1 @@
+Blueprint for UI and usage, including front-end/back-end modes, environment selector, and requirements management.

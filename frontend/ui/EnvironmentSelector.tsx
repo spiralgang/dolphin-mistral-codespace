@@ -1,0 +1,1 @@
+React component for selecting Preset Sandbox or Hardened Space, with automatic dependency management.
