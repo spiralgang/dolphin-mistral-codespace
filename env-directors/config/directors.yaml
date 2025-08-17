@@ -1,0 +1,187 @@
+# Director Configuration
+# This file configures the behavior of all environmental directors
+
+# Global settings
+global:
+  environment: "production"  # production, development, testing
+  log_level: "INFO"         # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  enable_metrics: true      # Enable performance metrics collection
+  max_concurrent_checks: 10 # Maximum number of concurrent security checks
+
+# Permissions Director Configuration
+permissions:
+  enabled: true
+  strict_mode: false        # If true, deny unknown permissions instead of allowing
+  cache_ttl: 300           # Permission cache time-to-live in seconds
+  default_role: "user"     # Default role for unauthenticated users
+  roles:
+    admin:
+      permissions: ["*"]    # Wildcard grants all permissions
+      denials: []
+    user:
+      permissions: 
+        - "file_access"
+        - "file_write"
+        - "directory_create"
+        - "network_access"
+      denials:
+        - "system_command"
+        - "file_delete"
+    guest:
+      permissions:
+        - "file_access"
+      denials:
+        - "file_write"
+        - "file_delete"
+        - "system_command"
+        - "directory_create"
+        - "symlink_create"
+        - "network_access"
+    system:
+      permissions:
+        - "system_command"
+        - "file_access"
+        - "file_write"
+        - "directory_create"
+      denials:
+        - "network_access"
+
+# Symlink Director Configuration
+symlink:
+  enabled: true
+  max_depth: 10            # Maximum symlink resolution depth
+  cache_ttl: 60            # Symlink resolution cache TTL in seconds
+  allowed_targets:         # Allowed target directories for symlinks
+    - "/tmp"
+    - "/var/tmp"
+    - "/home"
+    - "/opt/app"
+  forbidden_targets:       # Explicitly forbidden directories
+    - "/etc"
+    - "/usr/bin"
+    - "/boot"
+    - "/root"
+  auto_quarantine: true    # Automatically quarantine dangerous symlinks
+  check_loops: true        # Check for symlink loops during creation
+
+# File Security Director Configuration
+file_security:
+  enabled: true
+  quarantine_path: "/tmp/quarantine"
+  max_file_size_mb: 100    # Maximum allowed file size in MB
+  scan_extensions:         # File extensions to automatically scan
+    - ".exe"
+    - ".bat"
+    - ".sh"
+    - ".py"
+    - ".js"
+    - ".vbs"
+    - ".ps1"
+    - ".com"
+    - ".scr"
+  suspicious_extensions:   # Extensions that trigger extra scrutiny
+    - ".exe"
+    - ".bat"
+    - ".com"
+    - ".scr"
+    - ".vbs"
+  poison_pill_detection:
+    enabled: true
+    patterns:              # Custom patterns to detect
+      - "rm -rf /"
+      - "eval(base64_decode"
+      - "powershell -encodedcommand"
+      - "cmd.exe /c del"
+  malware_detection:
+    enabled: true
+    signature_updates: true
+    cloud_lookup: false    # Disable for privacy, enable for better detection
+  auto_quarantine_threshold: 50  # Risk score threshold for auto-quarantine
+
+# Memory Director Configuration  
+memory:
+  enabled: true
+  threshold_mb: 1024       # Memory usage threshold in MB
+  check_interval: 60       # Check interval in seconds
+  critical_threshold: 0.9  # Critical memory usage ratio (90%)
+  warning_threshold: 0.75  # Warning memory usage ratio (75%)
+  auto_gc_threshold: 0.85  # Automatically trigger GC at this ratio
+  leak_detection: true     # Enable memory leak detection
+  process_tracking: true   # Track individual process memory usage
+  cleanup_interval: 300    # Cleanup interval for expired entries (seconds)
+
+# Integration Settings
+integration:
+  android_agent:
+    enabled: false         # Enable Android agent integration
+    endpoint: "http://localhost:8080/api/security"
+    auth_token: "your-token-here"
+    timeout_ms: 5000
+  
+  python_agent:
+    enabled: true          # Enable Python agent integration
+    module_path: "env_directors.integration.python_agent"
+    auto_import: true
+    
+  webhook:
+    enabled: false
+    critical_alerts_url: "https://your-webhook.com/critical"
+    warning_alerts_url: "https://your-webhook.com/warnings"
+    retry_count: 3
+    timeout_ms: 10000
+
+# Monitoring and Alerting
+monitoring:
+  enabled: true
+  metrics_retention_days: 30
+  alert_channels:
+    email:
+      enabled: false
+      smtp_server: "smtp.example.com"
+      recipients: ["admin@example.com"]
+    slack:
+      enabled: false
+      webhook_url: "https://hooks.slack.com/your-webhook"
+      channel: "#security-alerts"
+    syslog:
+      enabled: true
+      facility: "LOG_SECURITY"
+      server: "localhost"
+      port: 514
+
+# Performance Tuning
+performance:
+  thread_pool_size: 5      # Number of worker threads for security checks
+  batch_processing: true   # Enable batch processing for multiple checks
+  cache_enabled: true      # Enable result caching
+  cache_size_limit: 10000  # Maximum number of cached results
+  async_processing: true   # Use asynchronous processing where possible
+
+# Security Settings
+security:
+  encrypted_config: false  # Whether to encrypt this config file
+  config_file_permissions: "0600"  # File permissions for config
+  require_signature: false # Require digital signature on config files
+  audit_all_access: true   # Log all access to security functions
+  
+# Development and Testing
+development:
+  debug_mode: false        # Enable debug logging and extended details
+  test_mode: false         # Enable test mode with relaxed security
+  mock_external_services: false  # Mock external service calls
+  performance_profiling: false   # Enable performance profiling
+
+# Backup and Recovery  
+backup:
+  enabled: true
+  backup_path: "/var/backup/env-directors"
+  retention_days: 7
+  include_quarantine: false  # Whether to backup quarantined files
+  compress: true
+  encrypt: false
+
+# Custom Extensions
+extensions:
+  custom_directors: []     # List of custom director classes to load
+  plugin_directory: "/opt/env-directors/plugins"
+  allow_external_plugins: false  # Whether to allow loading external plugins
