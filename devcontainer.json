@@ -1,0 +1,7 @@
+{
+  "name": "Codespace",
+  "dockerFile": "Dockerfile",
+  "appPort": [34873, 8000, 8001],
+  "postCreateCommand": "echo 'Setup complete!'",
+  "extensions": ["ms-python.python", "ms-vscode.vscode-typescript"]
+}
