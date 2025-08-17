@@ -1,0 +1,1 @@
+Prompt/chat-based mode UI component.

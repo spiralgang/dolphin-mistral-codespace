@@ -1,0 +1,1 @@
+Bash script to scan for and install all core requirements (system packages, Python, etc).
