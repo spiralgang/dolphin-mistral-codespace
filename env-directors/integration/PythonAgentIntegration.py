@@ -1,711 +1,596 @@
 #!/usr/bin/env python3
 """
-Sample Python integration for the environment director system.
-Provides Python-based security services and integration with existing Python infrastructure.
+PythonAgentIntegration - Integration layer for Python-based AI agents
+
+This integration provides a bridge between the ToolHub director system
+and Python applications, enabling comprehensive security monitoring,
+file system protection, and resource management for Python AI agents.
 """
 
-import asyncio
+import os
+import sys
 import json
-import logging
 import time
 import threading
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field, asdict
-from enum import Enum
-from pathlib import Path
-from typing import Dict, List, Optional, Any, Callable, Union
-import hashlib
-import socket
 import subprocess
-import sys
-import os
+from pathlib import Path
+from typing import Dict, List, Optional, Any, Callable
+from dataclasses import dataclass, asdict
+from enum import Enum
+import importlib.util
+
+# Import the FileSecurityDirector we created
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from directors.FileSecurityDirector import FileSecurityDirector, FileSecurityDirectorAdapter
 
 
-class SecurityLevel(Enum):
-    """Security level enumeration"""
-    INFO = "info"
-    WARNING = "warning"
-    ERROR = "error"
-    CRITICAL = "critical"
-
-
-class IntegrationStatus(Enum):
-    """Integration status enumeration"""
-    INACTIVE = "inactive"
-    INITIALIZING = "initializing"
-    ACTIVE = "active"
-    ERROR = "error"
-    SHUTTING_DOWN = "shutting_down"
+class PythonSecurityLevel(Enum):
+    MINIMAL = "minimal"
+    STANDARD = "standard" 
+    HARDENED = "hardened"
 
 
 @dataclass
-class SecurityContext:
-    """Security context for operations"""
-    operation: str
-    target: str
-    user: Optional[str] = None
-    environment: str = "production"
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class DirectorResult:
-    """Result from a director execution"""
-    success: bool
-    message: str
-    level: SecurityLevel = SecurityLevel.INFO
-    details: Dict[str, Any] = field(default_factory=dict)
-    timestamp: float = field(default_factory=time.time)
-
-
-@dataclass
-class PythonSecurityEvent:
-    """Security event for Python integration"""
-    event_type: str
-    severity: SecurityLevel
-    source: str
-    target: str
-    details: Dict[str, Any] = field(default_factory=dict)
-    timestamp: float = field(default_factory=time.time)
+class PythonAgentConfig:
+    """Configuration for Python agent security"""
+    security_level: PythonSecurityLevel = PythonSecurityLevel.STANDARD
+    max_memory_mb: int = 512
+    allowed_modules: List[str] = None
+    restricted_modules: List[str] = None
+    sandbox_mode: bool = False
+    network_access: bool = True
+    file_system_access: bool = True
+    temp_dir_access: bool = True
     
-    def to_dict(self) -> Dict[str, Any]:
-        result = asdict(self)
-        result['severity'] = self.severity.value
-        return result
+    def __post_init__(self):
+        if self.allowed_modules is None:
+            self.allowed_modules = []
+        if self.restricted_modules is None:
+            self.restricted_modules = ['os', 'subprocess', 'sys', '__builtin__', 'builtins']
+
+
+@dataclass
+class PythonEnvironmentInfo:
+    """Information about Python environment"""
+    python_version: str
+    virtual_env: Optional[str]
+    installed_packages: List[str]
+    sys_path: List[str]
+    working_directory: str
+    user_home: str
+    temp_directory: str
 
 
 class PythonAgentIntegration:
-    """
-    Python agent integration for the environment director system.
-    Provides Python-specific security services and seamless integration.
-    """
+    """Integration layer for Python AI agents with ToolHub directors"""
     
-    def __init__(self):
-        self.enabled = False
-        self.module_path = "env_directors.integration.python_agent"
-        self.auto_import = True
-        self.status = IntegrationStatus.INACTIVE
-        self.event_handlers: Dict[str, List[Callable]] = {}
-        self.security_hooks: Dict[str, Callable] = {}
-        self.metrics: Dict[str, Any] = {}
-        self.logger = self._setup_logger()
-        self._lock = threading.RLock()
-        self._shutdown_event = threading.Event()
+    def __init__(self, config: Optional[PythonAgentConfig] = None):
+        self.config = config or PythonAgentConfig()
+        self.file_security = FileSecurityDirectorAdapter()
+        self.environment_info = self._gather_environment_info()
+        self.hooks: Dict[str, List[Callable]] = {}
+        self.monitoring_active = False
+        self.monitor_thread: Optional[threading.Thread] = None
         
-        # Built-in security services
-        self.file_monitor = None
-        self.process_monitor = None
-        self.network_monitor = None
-
-    def initialize(self, config: Dict[str, Any]) -> bool:
+        # Security state
+        self.quarantined_files: List[str] = []
+        self.blocked_operations: List[str] = []
+        self.security_violations: List[str] = []
+        
+    def initialize(self) -> bool:
         """Initialize the Python agent integration"""
         try:
-            self.status = IntegrationStatus.INITIALIZING
+            print(f"[PythonAgentIntegration] Initializing with {self.config.security_level.value} security level")
             
-            self.enabled = config.get("enabled", False)
-            self.module_path = config.get("module_path", self.module_path)
-            self.auto_import = config.get("auto_import", True)
+            # Initialize file security director
+            file_config = {
+                "file_security.quarantine_dir": self._get_quarantine_dir(),
+                "file_security.scan_directories": self._get_scan_directories(),
+                "file_security.max_file_size": 10 * 1024 * 1024  # 10MB
+            }
             
-            if not self.enabled:
-                self.logger.info("PythonAgentIntegration disabled by configuration")
-                self.status = IntegrationStatus.INACTIVE
-                return True
-
-            # Initialize built-in services
-            self._initialize_services(config)
+            self.file_security.initialize(file_config)
             
-            # Set up security hooks
-            self._setup_security_hooks()
+            # Setup security policies based on configuration
+            self._setup_security_policies()
             
-            # Start monitoring threads
-            self._start_monitoring()
+            # Setup monitoring based on security level
+            self._setup_monitoring()
             
-            self.status = IntegrationStatus.ACTIVE
-            self.logger.info("PythonAgentIntegration initialized successfully")
+            # Install import hooks if in sandbox mode
+            if self.config.sandbox_mode:
+                self._install_import_hooks()
+            
+            # Setup memory monitoring
+            self._setup_memory_monitoring()
+            
+            print("[PythonAgentIntegration] Initialization complete")
             return True
             
         except Exception as e:
-            self.logger.error(f"Failed to initialize PythonAgentIntegration: {e}")
-            self.status = IntegrationStatus.ERROR
+            print(f"[PythonAgentIntegration] Initialization failed: {e}")
             return False
-
-    def is_enabled(self) -> bool:
-        return self.enabled
-
-    def get_status(self) -> IntegrationStatus:
-        return self.status
-
-    def register_event_handler(self, event_type: str, handler: Callable[[PythonSecurityEvent], None]):
-        """Register an event handler for specific event types"""
-        with self._lock:
-            if event_type not in self.event_handlers:
-                self.event_handlers[event_type] = []
-            self.event_handlers[event_type].append(handler)
+    
+    def perform_security_check(self) -> Dict[str, Any]:
+        """Perform comprehensive security check for Python environment"""
+        print("[PythonAgentIntegration] Performing security check...")
         
-        self.logger.info(f"Registered event handler for: {event_type}")
-
-    def emit_security_event(self, event: PythonSecurityEvent) -> bool:
-        """Emit a security event to registered handlers"""
-        try:
-            with self._lock:
-                handlers = self.event_handlers.get(event.event_type, []) + \
-                          self.event_handlers.get("*", [])  # Wildcard handlers
-            
-            for handler in handlers:
-                try:
-                    handler(event)
-                except Exception as e:
-                    self.logger.error(f"Event handler error: {e}")
-            
-            # Update metrics
-            self.metrics["events_emitted"] = self.metrics.get("events_emitted", 0) + 1
-            self.metrics["last_event_time"] = event.timestamp
-            
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Failed to emit security event: {e}")
-            return False
-
-    def execute_security_check(self, context: SecurityContext) -> DirectorResult:
-        """Execute a security check using Python-based logic"""
-        try:
-            if context.operation == "python_scan":
-                return self._python_code_scan(context.target)
-            elif context.operation == "pip_security":
-                return self._check_pip_packages(context)
-            elif context.operation == "import_security":
-                return self._check_import_security(context.target)
-            elif context.operation == "process_monitor":
-                return self._monitor_python_processes()
-            elif context.operation == "network_check":
-                return self._check_network_security()
-            else:
-                return DirectorResult(
-                    success=True,
-                    message="Operation not handled by Python integration",
-                    level=SecurityLevel.INFO
-                )
-                
-        except Exception as e:
-            return DirectorResult(
-                success=False,
-                message=f"Python security check failed: {e}",
-                level=SecurityLevel.ERROR
-            )
-
-    def install_import_hook(self) -> bool:
-        """Install import hook to monitor module loading"""
-        try:
-            import sys
-            
-            class SecurityImportHook:
-                def __init__(self, agent):
-                    self.agent = agent
-                    self.original_import = __builtins__['__import__']
-                
-                def __call__(self, name, globals=None, locals=None, fromlist=(), level=0):
-                    # Check if module is on blacklist
-                    if self.agent._is_module_blacklisted(name):
-                        event = PythonSecurityEvent(
-                            event_type="blocked_import",
-                            severity=SecurityLevel.WARNING,
-                            source="import_hook",
-                            target=name,
-                            details={"reason": "Module on security blacklist"}
-                        )
-                        self.agent.emit_security_event(event)
-                        raise ImportError(f"Import of {name} blocked by security policy")
-                    
-                    # Log suspicious imports
-                    if self.agent._is_module_suspicious(name):
-                        event = PythonSecurityEvent(
-                            event_type="suspicious_import",
-                            severity=SecurityLevel.INFO,
-                            source="import_hook",
-                            target=name,
-                            details={"caller": globals.get('__name__') if globals else 'unknown'}
-                        )
-                        self.agent.emit_security_event(event)
-                    
-                    return self.original_import(name, globals, locals, fromlist, level)
-            
-            __builtins__['__import__'] = SecurityImportHook(self)
-            self.logger.info("Import security hook installed")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Failed to install import hook: {e}")
-            return False
-
-    def scan_python_environment(self) -> Dict[str, Any]:
-        """Scan the Python environment for security issues"""
-        scan_results = {
-            "python_version": sys.version,
-            "executable_path": sys.executable,
-            "installed_packages": [],
-            "security_issues": [],
-            "recommendations": []
+        results = {
+            "timestamp": time.time(),
+            "file_security": {},
+            "module_security": {},
+            "environment_security": {},
+            "memory_security": {},
+            "overall_status": "unknown"
         }
         
         try:
-            # Check Python version
-            version_info = sys.version_info
-            if version_info.major == 2:
-                scan_results["security_issues"].append({
-                    "type": "deprecated_python",
-                    "severity": "critical",
-                    "message": "Python 2 is deprecated and has security vulnerabilities"
-                })
-            elif version_info < (3, 8):
-                scan_results["security_issues"].append({
-                    "type": "old_python_version",
-                    "severity": "warning", 
-                    "message": f"Python {version_info.major}.{version_info.minor} has known security issues"
-                })
+            # File security check
+            file_result = self.file_security.perform_security_check()
+            results["file_security"] = file_result
             
-            # Check installed packages
-            try:
-                import pkg_resources
-                packages = []
-                for dist in pkg_resources.working_set:
-                    packages.append({
-                        "name": dist.project_name,
-                        "version": dist.version,
-                        "location": dist.location
-                    })
-                scan_results["installed_packages"] = packages
-                
-                # Check for known vulnerable packages
-                vulnerable_packages = self._get_vulnerable_packages()
-                for package in packages:
-                    if package["name"].lower() in vulnerable_packages:
-                        scan_results["security_issues"].append({
-                            "type": "vulnerable_package",
-                            "severity": "warning",
-                            "package": package["name"],
-                            "version": package["version"],
-                            "message": f"Package {package['name']} has known vulnerabilities"
-                        })
-                        
-            except ImportError:
-                scan_results["security_issues"].append({
-                    "type": "missing_pkg_resources",
-                    "severity": "info",
-                    "message": "Cannot check installed packages - pkg_resources not available"
-                })
+            # Module security check
+            results["module_security"] = self._check_module_security()
             
-            # Check sys.path for suspicious entries
-            suspicious_paths = []
-            for path in sys.path:
-                if path and (
-                    path.startswith('/tmp/') or 
-                    path.startswith('/dev/shm/') or
-                    '/..' in path
-                ):
-                    suspicious_paths.append(path)
+            # Environment security check
+            results["environment_security"] = self._check_environment_security()
             
-            if suspicious_paths:
-                scan_results["security_issues"].append({
-                    "type": "suspicious_sys_path",
-                    "severity": "warning",
-                    "paths": suspicious_paths,
-                    "message": "Suspicious entries in sys.path detected"
-                })
+            # Memory security check
+            results["memory_security"] = self._check_memory_security()
             
-            # Generate recommendations
-            if len(scan_results["security_issues"]) == 0:
-                scan_results["recommendations"].append("Python environment appears secure")
-            else:
-                scan_results["recommendations"].extend([
-                    "Update Python to latest stable version",
-                    "Regularly update packages using pip",
-                    "Use virtual environments to isolate dependencies",
-                    "Monitor package vulnerabilities with safety or similar tools"
-                ])
-                
+            # Determine overall status
+            results["overall_status"] = self._calculate_overall_status(results)
+            
+            print(f"[PythonAgentIntegration] Security check complete: {results['overall_status']}")
+            return results
+            
         except Exception as e:
-            scan_results["security_issues"].append({
-                "type": "scan_error",
-                "severity": "error",
-                "message": f"Environment scan failed: {e}"
-            })
+            print(f"[PythonAgentIntegration] Security check failed: {e}")
+            results["error"] = str(e)
+            results["overall_status"] = "error"
+            return results
+    
+    def register_hook(self, event: str, callback: Callable) -> None:
+        """Register a security event hook"""
+        if event not in self.hooks:
+            self.hooks[event] = []
+        self.hooks[event].append(callback)
+        print(f"[PythonAgentIntegration] Registered hook for event: {event}")
+    
+    def execute_hooks(self, event: str, *args, **kwargs) -> None:
+        """Execute hooks for a specific event"""
+        if event in self.hooks:
+            for callback in self.hooks[event]:
+                try:
+                    callback(*args, **kwargs)
+                except Exception as e:
+                    print(f"[PythonAgentIntegration] Hook execution failed for {event}: {e}")
+    
+    def sandbox_eval(self, code: str, allowed_names: Optional[Dict[str, Any]] = None) -> Any:
+        """Safely evaluate Python code in sandboxed environment"""
+        if not self.config.sandbox_mode:
+            raise SecurityError("Sandbox mode not enabled")
         
-        return scan_results
-
-    def _initialize_services(self, config: Dict[str, Any]):
-        """Initialize built-in security services"""
-        # File monitoring service
-        if config.get("file_monitoring", {}).get("enabled", True):
-            self.file_monitor = PythonFileMonitor(self)
+        # Create restricted namespace
+        safe_globals = {
+            '__builtins__': self._get_safe_builtins(),
+            'len': len,
+            'str': str,
+            'int': int,
+            'float': float,
+            'bool': bool,
+            'list': list,
+            'dict': dict,
+            'tuple': tuple,
+            'set': set,
+        }
         
-        # Process monitoring service
-        if config.get("process_monitoring", {}).get("enabled", True):
-            self.process_monitor = PythonProcessMonitor(self)
-        
-        # Network monitoring service
-        if config.get("network_monitoring", {}).get("enabled", False):
-            self.network_monitor = PythonNetworkMonitor(self)
-
-    def _setup_security_hooks(self):
-        """Set up various security hooks"""
-        if self.auto_import:
-            self.install_import_hook()
-
-    def _start_monitoring(self):
-        """Start background monitoring threads"""
-        if self.file_monitor:
-            threading.Thread(target=self.file_monitor.start, daemon=True).start()
-        
-        if self.process_monitor:
-            threading.Thread(target=self.process_monitor.start, daemon=True).start()
-            
-        if self.network_monitor:
-            threading.Thread(target=self.network_monitor.start, daemon=True).start()
-
-    def _python_code_scan(self, file_path: str) -> DirectorResult:
-        """Scan Python code file for security issues"""
-        if not os.path.exists(file_path):
-            return DirectorResult(
-                success=False,
-                message=f"File not found: {file_path}",
-                level=SecurityLevel.ERROR
-            )
+        if allowed_names:
+            safe_globals.update(allowed_names)
         
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
+            # Execute hooks before evaluation
+            self.execute_hooks('before_eval', code=code)
             
-            issues = []
-            risk_score = 0
+            result = eval(code, safe_globals, {})
             
-            # Check for dangerous patterns
-            dangerous_patterns = [
-                (r'eval\s*\(', "eval() usage detected", 30),
-                (r'exec\s*\(', "exec() usage detected", 30),
-                (r'__import__\s*\(', "Dynamic import detected", 15),
-                (r'subprocess\.call\s*\(', "Subprocess call detected", 20),
-                (r'os\.system\s*\(', "os.system() usage detected", 40),
-                (r'input\s*\(.*\)', "input() usage detected", 10),
-                (r'pickle\.loads?\s*\(', "Pickle loading detected", 25),
+            # Execute hooks after evaluation
+            self.execute_hooks('after_eval', code=code, result=result)
+            
+            return result
+            
+        except Exception as e:
+            self.security_violations.append(f"Sandbox eval failed: {str(e)}")
+            self.execute_hooks('eval_error', code=code, error=e)
+            raise
+    
+    def validate_module_import(self, module_name: str) -> bool:
+        """Validate if a module import is allowed"""
+        # Check against explicitly allowed modules
+        if self.config.allowed_modules and module_name not in self.config.allowed_modules:
+            return False
+        
+        # Check against restricted modules
+        if module_name in self.config.restricted_modules:
+            return False
+        
+        # Additional security checks based on security level
+        if self.config.security_level == PythonSecurityLevel.HARDENED:
+            dangerous_modules = [
+                'subprocess', 'os', 'sys', 'socket', 'urllib',
+                'http', 'ftplib', 'smtplib', 'telnetlib',
+                'exec', 'eval', 'compile', '__import__'
             ]
-            
-            import re
-            for pattern, message, score in dangerous_patterns:
-                if re.search(pattern, content, re.IGNORECASE):
-                    issues.append(message)
-                    risk_score += score
-            
-            # Check imports
-            try:
-                import ast
-                tree = ast.parse(content)
-                for node in ast.walk(tree):
-                    if isinstance(node, ast.Import):
-                        for alias in node.names:
-                            if self._is_module_suspicious(alias.name):
-                                issues.append(f"Suspicious import: {alias.name}")
-                                risk_score += 15
-            except SyntaxError:
-                issues.append("Python syntax error in file")
-                risk_score += 50
-            
-            success = risk_score < 50
-            level = SecurityLevel.INFO
-            if risk_score >= 75:
-                level = SecurityLevel.CRITICAL
-            elif risk_score >= 50:
-                level = SecurityLevel.ERROR
-            elif risk_score >= 25:
-                level = SecurityLevel.WARNING
-            
-            return DirectorResult(
-                success=success,
-                message=f"Python code scan {'passed' if success else 'failed'} - Risk score: {risk_score}",
-                level=level,
-                details={
-                    "risk_score": risk_score,
-                    "issues": issues,
-                    "file_path": file_path
-                }
-            )
-            
-        except Exception as e:
-            return DirectorResult(
-                success=False,
-                message=f"Python code scan failed: {e}",
-                level=SecurityLevel.ERROR
-            )
-
-    def _check_pip_packages(self, context: SecurityContext) -> DirectorResult:
-        """Check pip packages for security vulnerabilities"""
+            if any(dangerous in module_name for dangerous in dangerous_modules):
+                return False
+        
+        return True
+    
+    def quarantine_file(self, file_path: str, reason: str = "Security violation") -> bool:
+        """Quarantine a suspicious file"""
+        success = self.file_security.director.quarantine_file(file_path)
+        if success:
+            self.quarantined_files.append(file_path)
+            self.execute_hooks('file_quarantined', file_path=file_path, reason=reason)
+        return success
+    
+    def get_quarantined_files(self) -> List[str]:
+        """Get list of quarantined files"""
+        return self.quarantined_files.copy()
+    
+    def get_security_violations(self) -> List[str]:
+        """Get list of security violations"""
+        return self.security_violations.copy()
+    
+    def cleanup_resources(self) -> Dict[str, Any]:
+        """Clean up resources and perform garbage collection"""
+        import gc
+        
+        before_objects = len(gc.get_objects())
+        before_memory = self._get_memory_usage()
+        
+        # Force garbage collection
+        gc.collect()
+        
+        after_objects = len(gc.get_objects())
+        after_memory = self._get_memory_usage()
+        
+        cleanup_result = {
+            "objects_freed": before_objects - after_objects,
+            "memory_freed_mb": (before_memory - after_memory) / (1024 * 1024),
+            "gc_stats": gc.get_stats() if hasattr(gc, 'get_stats') else None
+        }
+        
+        self.execute_hooks('resource_cleanup', result=cleanup_result)
+        return cleanup_result
+    
+    def start_monitoring(self) -> None:
+        """Start background security monitoring"""
+        if self.monitoring_active:
+            return
+        
+        self.monitoring_active = True
+        self.monitor_thread = threading.Thread(target=self._monitoring_loop, daemon=True)
+        self.monitor_thread.start()
+        print("[PythonAgentIntegration] Background monitoring started")
+    
+    def stop_monitoring(self) -> None:
+        """Stop background security monitoring"""
+        self.monitoring_active = False
+        if self.monitor_thread:
+            self.monitor_thread.join(timeout=5.0)
+        print("[PythonAgentIntegration] Background monitoring stopped")
+    
+    def shutdown(self) -> None:
+        """Shutdown the integration"""
+        print("[PythonAgentIntegration] Shutting down...")
+        
+        self.stop_monitoring()
+        self.execute_hooks('shutdown')
+        
+        # Clean up resources
+        self.cleanup_resources()
+        
+        print("[PythonAgentIntegration] Shutdown complete")
+    
+    def _gather_environment_info(self) -> PythonEnvironmentInfo:
+        """Gather information about the Python environment"""
         try:
-            result = subprocess.run([sys.executable, "-m", "pip", "list", "--format=json"], 
-                                  capture_output=True, text=True, timeout=30)
+            # Get installed packages
+            packages = []
+            try:
+                result = subprocess.run([sys.executable, '-m', 'pip', 'list'], 
+                                     capture_output=True, text=True, timeout=10)
+                if result.returncode == 0:
+                    packages = [line.split()[0] for line in result.stdout.strip().split('\n')[2:] 
+                               if line.strip()]
+            except:
+                pass
             
-            if result.returncode != 0:
-                return DirectorResult(
-                    success=False,
-                    message="Failed to get pip package list",
-                    level=SecurityLevel.ERROR
-                )
-            
-            packages = json.loads(result.stdout)
-            vulnerable_packages = self._get_vulnerable_packages()
-            
-            vulnerable_found = []
-            for package in packages:
-                if package["name"].lower() in vulnerable_packages:
-                    vulnerable_found.append(package)
-            
-            success = len(vulnerable_found) == 0
-            level = SecurityLevel.WARNING if vulnerable_found else SecurityLevel.INFO
-            
-            return DirectorResult(
-                success=success,
-                message=f"Pip security check: {len(vulnerable_found)} vulnerable packages found",
-                level=level,
-                details={
-                    "total_packages": len(packages),
-                    "vulnerable_packages": vulnerable_found
-                }
+            return PythonEnvironmentInfo(
+                python_version=sys.version,
+                virtual_env=os.environ.get('VIRTUAL_ENV'),
+                installed_packages=packages,
+                sys_path=sys.path.copy(),
+                working_directory=os.getcwd(),
+                user_home=str(Path.home()),
+                temp_directory=os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'tmp'))
             )
-            
         except Exception as e:
-            return DirectorResult(
-                success=False,
-                message=f"Pip security check failed: {e}",
-                level=SecurityLevel.ERROR
+            print(f"[PythonAgentIntegration] Error gathering environment info: {e}")
+            return PythonEnvironmentInfo(
+                python_version=sys.version,
+                virtual_env=None,
+                installed_packages=[],
+                sys_path=sys.path.copy(),
+                working_directory=os.getcwd(),
+                user_home=str(Path.home()),
+                temp_directory="/tmp"
             )
-
-    def _check_import_security(self, module_name: str) -> DirectorResult:
-        """Check if a module import is secure"""
-        if self._is_module_blacklisted(module_name):
-            return DirectorResult(
-                success=False,
-                message=f"Module {module_name} is blacklisted",
-                level=SecurityLevel.CRITICAL
-            )
+    
+    def _get_quarantine_dir(self) -> str:
+        """Get quarantine directory path"""
+        return os.path.join(self.environment_info.user_home, ".python_agent_quarantine")
+    
+    def _get_scan_directories(self) -> List[str]:
+        """Get directories to scan for security issues"""
+        dirs = [
+            self.environment_info.working_directory,
+            self.environment_info.temp_directory,
+        ]
         
-        if self._is_module_suspicious(module_name):
-            return DirectorResult(
-                success=True,
-                message=f"Module {module_name} flagged as suspicious",
-                level=SecurityLevel.WARNING,
-                details={"module": module_name, "reason": "Potentially dangerous functionality"}
-            )
+        if self.config.temp_dir_access:
+            dirs.extend(["/tmp", "/var/tmp"])
         
-        return DirectorResult(
-            success=True,
-            message=f"Module {module_name} import approved",
-            level=SecurityLevel.INFO
-        )
-
-    def _monitor_python_processes(self) -> DirectorResult:
-        """Monitor running Python processes"""
+        return dirs
+    
+    def _setup_security_policies(self) -> None:
+        """Setup security policies based on configuration"""
+        if self.config.security_level == PythonSecurityLevel.MINIMAL:
+            # Minimal security - basic file monitoring only
+            pass
+        elif self.config.security_level == PythonSecurityLevel.STANDARD:
+            # Standard security - moderate restrictions
+            self.config.restricted_modules.extend(['ctypes', 'ctypes.util'])
+        elif self.config.security_level == PythonSecurityLevel.HARDENED:
+            # Hardened security - strict restrictions
+            self.config.restricted_modules.extend([
+                'ctypes', 'ctypes.util', 'multiprocessing', 'threading',
+                'asyncio', 'concurrent.futures', 'pickle', 'marshal'
+            ])
+    
+    def _setup_monitoring(self) -> None:
+        """Setup monitoring based on security level"""
+        if self.config.security_level in [PythonSecurityLevel.STANDARD, PythonSecurityLevel.HARDENED]:
+            self.start_monitoring()
+    
+    def _install_import_hooks(self) -> None:
+        """Install import hooks for sandbox mode"""
+        original_import = __builtins__['__import__']
+        
+        def secure_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if not self.validate_module_import(name):
+                self.security_violations.append(f"Blocked import: {name}")
+                self.execute_hooks('import_blocked', module=name)
+                raise ImportError(f"Import of module '{name}' is not allowed")
+            
+            return original_import(name, globals, locals, fromlist, level)
+        
+        __builtins__['__import__'] = secure_import
+    
+    def _setup_memory_monitoring(self) -> None:
+        """Setup memory monitoring and limits"""
+        # This would integrate with system memory monitoring
+        # For now, just register hooks
+        self.register_hook('memory_warning', self._handle_memory_warning)
+    
+    def _handle_memory_warning(self, usage_mb: int) -> None:
+        """Handle memory warning"""
+        print(f"[PythonAgentIntegration] Memory warning: {usage_mb}MB used")
+        if usage_mb > self.config.max_memory_mb:
+            self.cleanup_resources()
+    
+    def _check_module_security(self) -> Dict[str, Any]:
+        """Check module-related security issues"""
+        issues = []
+        
+        # Check for dangerous modules in sys.modules
+        dangerous_modules = ['os', 'subprocess', 'ctypes', 'marshal', 'pickle']
+        loaded_dangerous = [mod for mod in dangerous_modules if mod in sys.modules]
+        
+        if loaded_dangerous and self.config.security_level == PythonSecurityLevel.HARDENED:
+            issues.extend([f"Dangerous module loaded: {mod}" for mod in loaded_dangerous])
+        
+        return {
+            "status": "FAIL" if issues else "PASS",
+            "issues": issues,
+            "loaded_modules": len(sys.modules),
+            "dangerous_modules_loaded": loaded_dangerous
+        }
+    
+    def _check_environment_security(self) -> Dict[str, Any]:
+        """Check environment-related security issues"""
+        issues = []
+        
+        # Check for suspicious environment variables
+        suspicious_vars = ['LD_PRELOAD', 'DYLD_INSERT_LIBRARIES', 'PYTHONPATH']
+        found_suspicious = [var for var in suspicious_vars if var in os.environ]
+        
+        if found_suspicious:
+            issues.extend([f"Suspicious environment variable: {var}" for var in found_suspicious])
+        
+        # Check working directory permissions
+        try:
+            cwd_stat = os.stat(self.environment_info.working_directory)
+            if cwd_stat.st_mode & 0o002:  # World writable
+                issues.append("Working directory is world-writable")
+        except OSError:
+            pass
+        
+        return {
+            "status": "WARN" if issues else "PASS",
+            "issues": issues,
+            "suspicious_env_vars": found_suspicious,
+            "python_version": self.environment_info.python_version
+        }
+    
+    def _check_memory_security(self) -> Dict[str, Any]:
+        """Check memory-related security issues"""
+        current_usage = self._get_memory_usage()
+        current_mb = current_usage / (1024 * 1024)
+        
+        issues = []
+        if current_mb > self.config.max_memory_mb:
+            issues.append(f"Memory usage exceeds limit: {current_mb:.1f}MB > {self.config.max_memory_mb}MB")
+        
+        return {
+            "status": "FAIL" if issues else "PASS",
+            "issues": issues,
+            "current_usage_mb": current_mb,
+            "max_allowed_mb": self.config.max_memory_mb
+        }
+    
+    def _get_memory_usage(self) -> int:
+        """Get current memory usage in bytes"""
         try:
             import psutil
-            python_processes = []
-            
-            for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'cpu_percent', 'memory_percent']):
-                try:
-                    if proc.info['name'] and 'python' in proc.info['name'].lower():
-                        python_processes.append({
-                            "pid": proc.info['pid'],
-                            "name": proc.info['name'],
-                            "cmdline": proc.info['cmdline'][:3] if proc.info['cmdline'] else [],
-                            "cpu_percent": proc.info['cpu_percent'],
-                            "memory_percent": proc.info['memory_percent']
-                        })
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-            
-            # Check for suspicious patterns
-            suspicious_processes = []
-            for proc in python_processes:
-                cmdline = ' '.join(proc['cmdline']) if proc['cmdline'] else ''
-                if any(pattern in cmdline.lower() for pattern in ['eval(', 'exec(', '--hidden', 'temp']):
-                    suspicious_processes.append(proc)
-            
-            level = SecurityLevel.WARNING if suspicious_processes else SecurityLevel.INFO
-            
-            return DirectorResult(
-                success=True,
-                message=f"Found {len(python_processes)} Python processes, {len(suspicious_processes)} suspicious",
-                level=level,
-                details={
-                    "python_processes": len(python_processes),
-                    "suspicious_processes": suspicious_processes
-                }
-            )
-            
+            process = psutil.Process()
+            return process.memory_info().rss
         except ImportError:
-            return DirectorResult(
-                success=False,
-                message="psutil not available for process monitoring",
-                level=SecurityLevel.ERROR
-            )
-        except Exception as e:
-            return DirectorResult(
-                success=False,
-                message=f"Process monitoring failed: {e}",
-                level=SecurityLevel.ERROR
-            )
-
-    def _check_network_security(self) -> DirectorResult:
-        """Check network security for Python processes"""
-        try:
-            # Check for open sockets
-            import socket
-            hostname = socket.gethostname()
-            local_ip = socket.gethostbyname(hostname)
-            
-            # Simple port scan of common Python ports
-            python_ports = [8000, 8080, 5000, 8888, 3000, 8081]
-            open_ports = []
-            
-            for port in python_ports:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(1)
-                result = sock.connect_ex((local_ip, port))
-                if result == 0:
-                    open_ports.append(port)
-                sock.close()
-            
-            level = SecurityLevel.WARNING if open_ports else SecurityLevel.INFO
-            
-            return DirectorResult(
-                success=True,
-                message=f"Network check: {len(open_ports)} Python-related ports open",
-                level=level,
-                details={
-                    "hostname": hostname,
-                    "local_ip": local_ip,
-                    "open_ports": open_ports
-                }
-            )
-            
-        except Exception as e:
-            return DirectorResult(
-                success=False,
-                message=f"Network security check failed: {e}",
-                level=SecurityLevel.ERROR
-            )
-
-    def _is_module_blacklisted(self, module_name: str) -> bool:
-        """Check if module is on the blacklist"""
-        blacklisted_modules = {
-            'ctypes', 'subprocess', 'os', 'importlib', 'sys'
-        }
-        return module_name.split('.')[0] in blacklisted_modules
-
-    def _is_module_suspicious(self, module_name: str) -> bool:
-        """Check if module is suspicious"""
-        suspicious_modules = {
-            'requests', 'urllib', 'socket', 'pickle', 'marshal', 
-            'base64', 'codecs', 'tempfile', 'shutil'
-        }
-        return module_name.split('.')[0] in suspicious_modules
-
-    def _get_vulnerable_packages(self) -> set:
-        """Get list of known vulnerable packages"""
-        # In a real implementation, this would fetch from a vulnerability database
-        return {
-            'pyyaml', 'pillow', 'urllib3', 'requests', 'jinja2',
-            'django', 'flask', 'cryptography', 'paramiko'
-        }
-
-    def _setup_logger(self) -> logging.Logger:
-        """Set up logger for the integration"""
-        logger = logging.getLogger('PythonAgentIntegration')
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        )
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-        logger.setLevel(logging.INFO)
-        return logger
-
-    def get_metrics(self) -> Dict[str, Any]:
-        """Get current metrics"""
-        return {
-            **self.metrics,
-            "status": self.status.value,
-            "enabled": self.enabled,
-            "event_handlers": len(self.event_handlers),
-            "uptime": time.time() - self.metrics.get("start_time", time.time())
-        }
-
-    def shutdown(self):
-        """Shutdown the integration"""
-        self.status = IntegrationStatus.SHUTTING_DOWN
-        self._shutdown_event.set()
-        self.logger.info("PythonAgentIntegration shutting down")
-
-
-# Supporting monitor classes
-class PythonFileMonitor:
-    def __init__(self, agent):
-        self.agent = agent
+            # Fallback method
+            import resource
+            return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+    
+    def _calculate_overall_status(self, results: Dict[str, Any]) -> str:
+        """Calculate overall security status"""
+        statuses = []
+        for category, result in results.items():
+            if isinstance(result, dict) and 'status' in result:
+                statuses.append(result['status'])
         
-    def start(self):
-        # File monitoring implementation would go here
-        pass
-
-
-class PythonProcessMonitor:
-    def __init__(self, agent):
-        self.agent = agent
+        if 'FAIL' in statuses or 'ERROR' in statuses:
+            return 'FAIL'
+        elif 'WARN' in statuses:
+            return 'WARN'
+        else:
+            return 'PASS'
+    
+    def _get_safe_builtins(self) -> Dict[str, Any]:
+        """Get safe builtins for sandbox execution"""
+        safe_builtins = {
+            'abs': abs,
+            'all': all,
+            'any': any,
+            'bin': bin,
+            'bool': bool,
+            'chr': chr,
+            'dict': dict,
+            'enumerate': enumerate,
+            'filter': filter,
+            'float': float,
+            'hex': hex,
+            'int': int,
+            'len': len,
+            'list': list,
+            'map': map,
+            'max': max,
+            'min': min,
+            'oct': oct,
+            'ord': ord,
+            'range': range,
+            'reversed': reversed,
+            'round': round,
+            'set': set,
+            'slice': slice,
+            'sorted': sorted,
+            'str': str,
+            'sum': sum,
+            'tuple': tuple,
+            'type': type,
+            'zip': zip,
+        }
         
-    def start(self):
-        # Process monitoring implementation would go here
-        pass
+        return safe_builtins
+    
+    def _monitoring_loop(self) -> None:
+        """Background monitoring loop"""
+        while self.monitoring_active:
+            try:
+                # Perform periodic security checks
+                self.perform_security_check()
+                
+                # Sleep for monitoring interval
+                time.sleep(60)  # Check every minute
+                
+            except Exception as e:
+                print(f"[PythonAgentIntegration] Monitoring error: {e}")
+                time.sleep(30)  # Shorter sleep on error
 
 
-class PythonNetworkMonitor:
-    def __init__(self, agent):
-        self.agent = agent
-        
-    def start(self):
-        # Network monitoring implementation would go here
-        pass
+class SecurityError(Exception):
+    """Custom security exception"""
+    pass
+
+
+# Convenience functions and helpers
+def create_minimal_integration() -> PythonAgentIntegration:
+    """Create integration with minimal security"""
+    config = PythonAgentConfig(
+        security_level=PythonSecurityLevel.MINIMAL,
+        sandbox_mode=False,
+        max_memory_mb=1024
+    )
+    return PythonAgentIntegration(config)
+
+
+def create_standard_integration() -> PythonAgentIntegration:
+    """Create integration with standard security"""
+    config = PythonAgentConfig(
+        security_level=PythonSecurityLevel.STANDARD,
+        sandbox_mode=True,
+        max_memory_mb=512,
+        network_access=True,
+        file_system_access=True
+    )
+    return PythonAgentIntegration(config)
+
+
+def create_hardened_integration() -> PythonAgentIntegration:
+    """Create integration with hardened security"""
+    config = PythonAgentConfig(
+        security_level=PythonSecurityLevel.HARDENED,
+        sandbox_mode=True,
+        max_memory_mb=256,
+        network_access=False,
+        file_system_access=False,
+        temp_dir_access=False
+    )
+    return PythonAgentIntegration(config)
 
 
 # Example usage
 if __name__ == "__main__":
-    integration = PythonAgentIntegration()
+    print("Python Agent Integration Example")
     
-    config = {
-        "enabled": True,
-        "module_path": "env_directors.integration.python_agent",
-        "auto_import": True,
-        "file_monitoring": {"enabled": True},
-        "process_monitoring": {"enabled": True},
-        "network_monitoring": {"enabled": False}
-    }
+    # Create standard integration
+    integration = create_standard_integration()
     
-    if integration.initialize(config):
-        print("Python integration initialized successfully")
+    if integration.initialize():
+        print("Integration initialized successfully")
         
-        # Register event handler
-        def security_event_handler(event: PythonSecurityEvent):
-            print(f"Security Event: {event.event_type} - {event.severity.value} - {event.message if hasattr(event, 'message') else 'No message'}")
+        # Perform security check
+        result = integration.perform_security_check()
+        print(f"Security check result: {result['overall_status']}")
         
-        integration.register_event_handler("*", security_event_handler)
+        # Example of sandbox evaluation
+        if integration.config.sandbox_mode:
+            try:
+                result = integration.sandbox_eval("1 + 2 + 3")
+                print(f"Sandbox eval result: {result}")
+            except Exception as e:
+                print(f"Sandbox eval error: {e}")
         
-        # Example: Scan environment
-        env_scan = integration.scan_python_environment()
-        print(f"Environment scan completed: {len(env_scan.get('security_issues', []))} issues found")
-        
-        # Example: Check a Python file
-        context = SecurityContext(
-            operation="python_scan",
-            target=__file__
-        )
-        
-        result = integration.execute_security_check(context)
-        print(f"Code scan result: {result.success} - {result.message}")
-        
-        time.sleep(5)
+        # Cleanup
         integration.shutdown()
+    else:
+        print("Integration initialization failed")

@@ -1,253 +1,215 @@
-package com.spiralgang.dolphin.envdirectors
+package dolphin.mistral.envdirectors
 
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CompletableFuture
-import kotlin.reflect.KClass
+import kotlin.collections.mutableMapOf
+import kotlin.collections.mutableListOf
 
 /**
- * Central hub for the modular security and environment director system.
- * Provides unified API, data models, and coordination between different directors.
+ * Central ToolHub/DirectorHub API for coordinating all environment directors.
+ * 
+ * This hub provides a unified interface for managing security, permissions,
+ * symlink defense, memory management, and other environmental concerns
+ * through pluggable director modules.
  */
 class ToolHub {
-    private val directors = ConcurrentHashMap<String, Director>()
-    private val config = DirectorConfig()
-    private var initialized = false
-
+    private val directors = mutableMapOf<String, Director>()
+    private val hooks = mutableMapOf<String, MutableList<() -> Unit>>()
+    private val config = mutableMapOf<String, Any>()
+    
     companion object {
-        @Volatile
-        private var INSTANCE: ToolHub? = null
+        private var instance: ToolHub? = null
         
         fun getInstance(): ToolHub {
-            return INSTANCE ?: synchronized(this) {
-                INSTANCE ?: ToolHub().also { INSTANCE = it }
+            if (instance == null) {
+                instance = ToolHub()
             }
+            return instance!!
         }
     }
-
+    
     /**
-     * Initialize the ToolHub with configuration and register available directors
+     * Register a director module with the hub
      */
-    fun initialize(configPath: String? = null): CompletableFuture<Boolean> {
-        return CompletableFuture.supplyAsync {
-            try {
-                if (configPath != null) {
-                    config.loadFromFile(configPath)
-                }
-                
-                // Auto-register available directors
-                registerAvailableDirectors()
-                initialized = true
-                println("ToolHub initialized successfully with ${directors.size} directors")
-                true
-            } catch (e: Exception) {
-                println("Failed to initialize ToolHub: ${e.message}")
-                false
-            }
-        }
+    fun registerDirector(name: String, director: Director) {
+        directors[name] = director
+        director.initialize(this)
+        println("[ToolHub] Registered director: $name")
     }
-
+    
     /**
-     * Register a director with the hub
+     * Unregister a director module
      */
-    fun <T : Director> registerDirector(name: String, director: T): Boolean {
-        return try {
-            directors[name] = director
-            director.initialize(config.getDirectorConfig(name))
-            println("Registered director: $name")
-            true
-        } catch (e: Exception) {
-            println("Failed to register director $name: ${e.message}")
-            false
-        }
+    fun unregisterDirector(name: String) {
+        directors[name]?.shutdown()
+        directors.remove(name)
+        println("[ToolHub] Unregistered director: $name")
     }
-
+    
     /**
-     * Get a registered director by name
+     * Get a specific director by name
      */
-    @Suppress("UNCHECKED_CAST")
-    fun <T : Director> getDirector(name: String, type: KClass<T>): T? {
-        return directors[name] as? T
+    fun getDirector(name: String): Director? {
+        return directors[name]
     }
-
+    
+    /**
+     * Get all registered directors
+     */
+    fun getAllDirectors(): Map<String, Director> {
+        return directors.toMap()
+    }
+    
     /**
      * Execute a security check across all relevant directors
      */
-    fun performSecurityCheck(context: SecurityContext): CompletableFuture<SecurityReport> {
-        return CompletableFuture.supplyAsync {
-            val results = mutableMapOf<String, DirectorResult>()
-            
-            directors.values.parallelStream().forEach { director ->
-                try {
-                    if (director.isApplicable(context)) {
-                        val result = director.execute(context)
-                        synchronized(results) {
-                            results[director.getName()] = result
-                        }
-                    }
-                } catch (e: Exception) {
-                    synchronized(results) {
-                        results[director.getName()] = DirectorResult(
-                            success = false,
-                            message = "Director execution failed: ${e.message}",
-                            level = SecurityLevel.ERROR
-                        )
-                    }
-                }
-            }
-            
-            SecurityReport(results)
-        }
-    }
-
-    /**
-     * Get status of all registered directors
-     */
-    fun getDirectorStatus(): Map<String, DirectorStatus> {
-        return directors.mapValues { (_, director) ->
-            DirectorStatus(
-                name = director.getName(),
-                enabled = director.isEnabled(),
-                healthy = director.healthCheck(),
-                lastRun = director.getLastRunTime()
-            )
-        }
-    }
-
-    /**
-     * Auto-register available directors based on configuration
-     */
-    private fun registerAvailableDirectors() {
-        // Note: In a real implementation, this would use reflection or dependency injection
-        // to discover and instantiate available directors
-        println("Auto-registering directors...")
+    fun executeSecurityCheck(): SecurityReport {
+        val report = SecurityReport()
         
-        // Register core directors (would be loaded dynamically in production)
-        if (config.isDirectorEnabled("permissions")) {
-            // registerDirector("permissions", PermissionsDirector())
+        directors.values.forEach { director ->
+            try {
+                val result = director.performSecurityCheck()
+                report.addDirectorResult(director.getName(), result)
+            } catch (e: Exception) {
+                report.addError(director.getName(), e.message ?: "Unknown error")
+            }
         }
-        if (config.isDirectorEnabled("symlink")) {
-            // registerDirector("symlink", SymlinkDirector())
+        
+        return report
+    }
+    
+    /**
+     * Set configuration value
+     */
+    fun setConfig(key: String, value: Any) {
+        config[key] = value
+    }
+    
+    /**
+     * Get configuration value
+     */
+    fun getConfig(key: String): Any? {
+        return config[key]
+    }
+    
+    /**
+     * Register a lifecycle hook
+     */
+    fun registerHook(event: String, callback: () -> Unit) {
+        if (!hooks.containsKey(event)) {
+            hooks[event] = mutableListOf()
         }
-        if (config.isDirectorEnabled("memory")) {
-            // registerDirector("memory", MemoryDirector())
+        hooks[event]?.add(callback)
+    }
+    
+    /**
+     * Execute lifecycle hooks
+     */
+    fun executeHooks(event: String) {
+        hooks[event]?.forEach { callback ->
+            try {
+                callback()
+            } catch (e: Exception) {
+                println("[ToolHub] Hook execution failed for $event: ${e.message}")
+            }
         }
     }
-
-    fun isInitialized(): Boolean = initialized
+    
+    /**
+     * Initialize all directors and execute startup hooks
+     */
+    fun startup() {
+        executeHooks("startup")
+        directors.values.forEach { director ->
+            try {
+                director.startup()
+            } catch (e: Exception) {
+                println("[ToolHub] Director ${director.getName()} startup failed: ${e.message}")
+            }
+        }
+    }
+    
+    /**
+     * Shutdown all directors and execute shutdown hooks
+     */
+    fun shutdown() {
+        executeHooks("shutdown")
+        directors.values.forEach { director ->
+            try {
+                director.shutdown()
+            } catch (e: Exception) {
+                println("[ToolHub] Director ${director.getName()} shutdown failed: ${e.message}")
+            }
+        }
+    }
 }
 
 /**
- * Base interface for all directors
+ * Base interface for all director modules
  */
-interface Director {
-    fun getName(): String
-    fun initialize(config: Map<String, Any>): Boolean
-    fun isEnabled(): Boolean
-    fun isApplicable(context: SecurityContext): Boolean
-    fun execute(context: SecurityContext): DirectorResult
-    fun healthCheck(): Boolean
-    fun getLastRunTime(): Long?
+abstract class Director {
+    abstract fun getName(): String
+    abstract fun initialize(hub: ToolHub)
+    abstract fun performSecurityCheck(): DirectorResult
+    
+    open fun startup() {
+        // Default implementation - can be overridden
+    }
+    
+    open fun shutdown() {
+        // Default implementation - can be overridden  
+    }
 }
 
 /**
- * Security context for director operations
- */
-data class SecurityContext(
-    val operation: String,
-    val target: String,
-    val user: String? = null,
-    val environment: String = "production",
-    val metadata: Map<String, Any> = emptyMap()
-)
-
-/**
- * Result from a director execution
+ * Result from a director's security check
  */
 data class DirectorResult(
-    val success: Boolean,
+    val status: Status,
     val message: String,
-    val level: SecurityLevel = SecurityLevel.INFO,
-    val details: Map<String, Any> = emptyMap(),
-    val timestamp: Long = System.currentTimeMillis()
-)
-
-/**
- * Overall security report
- */
-data class SecurityReport(
-    val results: Map<String, DirectorResult>,
-    val overallStatus: SecurityLevel = determineOverallStatus(results),
-    val timestamp: Long = System.currentTimeMillis()
+    val details: Map<String, Any> = emptyMap()
 ) {
-    companion object {
-        private fun determineOverallStatus(results: Map<String, DirectorResult>): SecurityLevel {
-            return when {
-                results.values.any { it.level == SecurityLevel.CRITICAL } -> SecurityLevel.CRITICAL
-                results.values.any { it.level == SecurityLevel.ERROR } -> SecurityLevel.ERROR
-                results.values.any { it.level == SecurityLevel.WARNING } -> SecurityLevel.WARNING
-                else -> SecurityLevel.INFO
-            }
-        }
+    enum class Status {
+        PASS, WARN, FAIL, ERROR
     }
 }
 
 /**
- * Security levels for results
+ * Overall security report from all directors
  */
-enum class SecurityLevel {
-    INFO, WARNING, ERROR, CRITICAL
-}
-
-/**
- * Director status information
- */
-data class DirectorStatus(
-    val name: String,
-    val enabled: Boolean,
-    val healthy: Boolean,
-    val lastRun: Long?
-)
-
-/**
- * Configuration management for directors
- */
-class DirectorConfig {
-    private val config = mutableMapOf<String, Map<String, Any>>()
+class SecurityReport {
+    private val results = mutableMapOf<String, DirectorResult>()
+    private val errors = mutableMapOf<String, String>()
     
-    fun loadFromFile(path: String) {
-        // In production, this would parse YAML/JSON config file
-        println("Loading config from: $path")
+    fun addDirectorResult(directorName: String, result: DirectorResult) {
+        results[directorName] = result
+    }
+    
+    fun addError(directorName: String, error: String) {
+        errors[directorName] = error
+    }
+    
+    fun getResults(): Map<String, DirectorResult> = results.toMap()
+    fun getErrors(): Map<String, String> = errors.toMap()
+    
+    fun hasFailures(): Boolean {
+        return results.values.any { it.status == DirectorResult.Status.FAIL } || errors.isNotEmpty()
+    }
+    
+    fun hasWarnings(): Boolean {
+        return results.values.any { it.status == DirectorResult.Status.WARN }
+    }
+    
+    override fun toString(): String {
+        val sb = StringBuilder()
+        sb.append("=== Security Report ===\n")
         
-        // Default configuration
-        config["permissions"] = mapOf(
-            "enabled" to true,
-            "strict_mode" to false,
-            "cache_ttl" to 300
-        )
-        config["symlink"] = mapOf(
-            "enabled" to true,
-            "max_depth" to 10,
-            "allowed_targets" to listOf("/tmp", "/var/tmp")
-        )
-        config["memory"] = mapOf(
-            "enabled" to true,
-            "threshold_mb" to 1024,
-            "check_interval" to 60
-        )
-        config["file_security"] = mapOf(
-            "enabled" to true,
-            "scan_extensions" to listOf(".exe", ".bat", ".sh"),
-            "quarantine_path" to "/tmp/quarantine"
-        )
+        results.forEach { (name, result) ->
+            sb.append("[$name] ${result.status}: ${result.message}\n")
+        }
+        
+        errors.forEach { (name, error) ->
+            sb.append("[$name] ERROR: $error\n")
+        }
+        
+        return sb.toString()
     }
-    
-    fun isDirectorEnabled(name: String): Boolean {
-        return config[name]?.get("enabled") as? Boolean ?: false
-    }
-    
-    fun getDirectorConfig(name: String): Map<String, Any> {
-        return config[name] ?: emptyMap()
-    }
-    
-    fun getAllConfig(): Map<String, Map<String, Any>> = config.toMap()
 }

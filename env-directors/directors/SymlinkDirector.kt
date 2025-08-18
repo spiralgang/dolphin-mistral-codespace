@@ -1,417 +1,390 @@
-package com.spiralgang.dolphin.envdirectors.directors
+package dolphin.mistral.envdirectors.directors
 
-import com.spiralgang.dolphin.envdirectors.*
+import dolphin.mistral.envdirectors.Director
+import dolphin.mistral.envdirectors.DirectorResult
+import dolphin.mistral.envdirectors.ToolHub
 import java.io.File
-import java.nio.file.*
-import java.util.concurrent.ConcurrentHashMap
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.Paths
 
 /**
- * Director responsible for symlink security checks and validation.
- * Prevents symlink attacks, validates symlink targets, and enforces path restrictions.
+ * SymlinkDirector provides defense against symlink attacks and poison pill vulnerabilities
+ * 
+ * This director monitors symbolic links, prevents directory traversal attacks,
+ * and protects against malicious symlink-based exploits that could compromise
+ * file system integrity or bypass security controls.
  */
-class SymlinkDirector : Director {
-    private var enabled = true
-    private var maxDepth = 10
-    private var allowedTargets = setOf("/tmp", "/var/tmp")
-    private val symlinkCache = ConcurrentHashMap<String, CachedSymlinkInfo>()
-    private var lastRun: Long? = null
-
-    companion object {
-        private const val CACHE_TTL_MS = 60000L // 1 minute cache
-        private const val MAX_CACHE_SIZE = 1000
-    }
-
-    override fun getName(): String = "symlink"
-
-    override fun initialize(config: Map<String, Any>): Boolean {
-        return try {
-            enabled = config["enabled"] as? Boolean ?: true
-            maxDepth = (config["max_depth"] as? Number)?.toInt() ?: 10
-            
-            @Suppress("UNCHECKED_CAST")
-            val targets = config["allowed_targets"] as? List<String>
-            allowedTargets = targets?.toSet() ?: setOf("/tmp", "/var/tmp")
-            
-            println("SymlinkDirector initialized - Max depth: $maxDepth, Allowed targets: $allowedTargets")
-            true
-        } catch (e: Exception) {
-            println("Failed to initialize SymlinkDirector: ${e.message}")
-            false
-        }
-    }
-
-    override fun isEnabled(): Boolean = enabled
-
-    override fun isApplicable(context: SecurityContext): Boolean {
-        return context.operation in listOf(
-            "symlink_create", "symlink_follow", "file_access", 
-            "directory_traverse", "path_resolve"
-        )
-    }
-
-    override fun execute(context: SecurityContext): DirectorResult {
-        lastRun = System.currentTimeMillis()
+class SymlinkDirector : Director() {
+    
+    private lateinit var hub: ToolHub
+    private val protectedPaths = mutableSetOf<String>()
+    private val suspiciousSymlinks = mutableListOf<String>()
+    private val allowedTargets = mutableSetOf<String>()
+    private var maxSymlinkDepth = 5
+    
+    override fun getName(): String = "SymlinkDirector"
+    
+    override fun initialize(hub: ToolHub) {
+        this.hub = hub
         
-        return try {
-            when (context.operation) {
-                "symlink_create" -> validateSymlinkCreation(context.target, context.metadata)
-                "symlink_follow" -> validateSymlinkFollow(context.target)
-                "file_access", "directory_traverse", "path_resolve" -> validatePath(context.target)
+        // Initialize protected paths
+        protectedPaths.addAll(listOf(
+            "/etc",
+            "/root", 
+            "/usr/bin",
+            "/usr/sbin",
+            System.getProperty("user.home")
+        ))
+        
+        // Load configuration
+        val config = hub.getConfig("symlink.maxDepth") as? Int
+        if (config != null) {
+            maxSymlinkDepth = config
+        }
+        
+        val allowedTargetConfig = hub.getConfig("symlink.allowedTargets") as? List<String>
+        if (allowedTargetConfig != null) {
+            allowedTargets.addAll(allowedTargetConfig)
+        }
+        
+        println("[SymlinkDirector] Initialized with ${protectedPaths.size} protected paths")
+    }
+    
+    override fun performSecurityCheck(): DirectorResult {
+        val issues = mutableListOf<String>()
+        val details = mutableMapOf<String, Any>()
+        
+        try {
+            // Clear previous results
+            suspiciousSymlinks.clear()
+            
+            // Check for malicious symlinks
+            val maliciousLinks = scanForMaliciousSymlinks()
+            if (maliciousLinks.isNotEmpty()) {
+                issues.add("Found ${maliciousLinks.size} potentially malicious symlinks")
+                details["maliciousSymlinks"] = maliciousLinks.take(10)
+            }
+            
+            // Check for symlink loops
+            val loops = detectSymlinkLoops()
+            if (loops.isNotEmpty()) {
+                issues.add("Detected ${loops.size} symlink loops")
+                details["symlinkLoops"] = loops
+            }
+            
+            // Check for excessive symlink depth
+            val deepLinks = findExcessivelyDeepSymlinks()
+            if (deepLinks.isNotEmpty()) {
+                issues.add("Found ${deepLinks.size} symlinks exceeding depth limit")
+                details["deepSymlinks"] = deepLinks.take(5)
+            }
+            
+            // Check for poison pill files
+            val poisonPills = detectPoisonPillFiles()
+            if (poisonPills.isNotEmpty()) {
+                issues.add("Detected ${poisonPills.size} potential poison pill files")
+                details["poisonPills"] = poisonPills.take(5)
+            }
+            
+            details["protectedPathsChecked"] = protectedPaths.size
+            details["maxDepth"] = maxSymlinkDepth
+            
+            return when {
+                issues.isEmpty() -> DirectorResult(
+                    DirectorResult.Status.PASS,
+                    "All symlink security checks passed",
+                    details
+                )
+                issues.any { it.contains("malicious") || it.contains("poison") } -> DirectorResult(
+                    DirectorResult.Status.FAIL,
+                    "Critical symlink security threats detected: ${issues.joinToString("; ")}",
+                    details
+                )
                 else -> DirectorResult(
-                    success = true,
-                    message = "Operation not applicable to symlink director",
-                    level = SecurityLevel.INFO
+                    DirectorResult.Status.WARN,
+                    "Symlink issues found: ${issues.joinToString("; ")}",
+                    details
                 )
             }
+            
         } catch (e: Exception) {
-            DirectorResult(
-                success = false,
-                message = "Symlink validation failed: ${e.message}",
-                level = SecurityLevel.ERROR
+            return DirectorResult(
+                DirectorResult.Status.ERROR,
+                "Symlink security check failed: ${e.message}",
+                mapOf("exception" to e.javaClass.simpleName)
             )
         }
     }
-
-    override fun healthCheck(): Boolean {
-        return try {
-            enabled && maxDepth > 0 && allowedTargets.isNotEmpty()
+    
+    /**
+     * Add a path to protect from symlink attacks
+     */
+    fun addProtectedPath(path: String) {
+        protectedPaths.add(path)
+    }
+    
+    /**
+     * Remove a protected path
+     */
+    fun removeProtectedPath(path: String) {
+        protectedPaths.remove(path)
+    }
+    
+    /**
+     * Add an allowed symlink target pattern
+     */
+    fun addAllowedTarget(pattern: String) {
+        allowedTargets.add(pattern)
+    }
+    
+    /**
+     * Validate a symlink path for security
+     */
+    fun validateSymlink(symlinkPath: String): ValidationResult {
+        try {
+            val path = Paths.get(symlinkPath)
+            
+            if (!Files.isSymbolicLink(path)) {
+                return ValidationResult(false, "Not a symbolic link")
+            }
+            
+            val target = Files.readSymbolicLink(path)
+            val resolvedTarget = path.resolveSibling(target).normalize()
+            
+            // Check for directory traversal
+            if (containsDirectoryTraversal(target.toString())) {
+                return ValidationResult(false, "Contains directory traversal sequence")
+            }
+            
+            // Check if target is in protected area
+            if (isTargetingProtectedPath(resolvedTarget.toString())) {
+                return ValidationResult(false, "Targets protected path")
+            }
+            
+            // Check symlink depth
+            val depth = calculateSymlinkDepth(path)
+            if (depth > maxSymlinkDepth) {
+                return ValidationResult(false, "Exceeds maximum symlink depth ($depth > $maxSymlinkDepth)")
+            }
+            
+            // Check against allowed targets
+            if (allowedTargets.isNotEmpty() && !isTargetAllowed(resolvedTarget.toString())) {
+                return ValidationResult(false, "Target not in allowed list")
+            }
+            
+            return ValidationResult(true, "Symlink is safe")
+            
         } catch (e: Exception) {
+            return ValidationResult(false, "Validation error: ${e.message}")
+        }
+    }
+    
+    /**
+     * Remove a malicious symlink safely
+     */
+    fun removeMaliciousSymlink(symlinkPath: String): Boolean {
+        return try {
+            val path = Paths.get(symlinkPath)
+            if (Files.isSymbolicLink(path)) {
+                Files.delete(path)
+                println("[SymlinkDirector] Removed malicious symlink: $symlinkPath")
+                true
+            } else {
+                false
+            }
+        } catch (e: Exception) {
+            println("[SymlinkDirector] Failed to remove symlink $symlinkPath: ${e.message}")
             false
         }
     }
-
-    override fun getLastRunTime(): Long? = lastRun
-
-    /**
-     * Validate symlink creation request
-     */
-    private fun validateSymlinkCreation(linkPath: String, metadata: Map<String, Any>): DirectorResult {
-        val targetPath = metadata["target"] as? String
-            ?: return DirectorResult(
-                success = false,
-                message = "No target path specified for symlink creation",
-                level = SecurityLevel.ERROR
+    
+    private fun scanForMaliciousSymlinks(): List<String> {
+        val maliciousLinks = mutableListOf<String>()
+        
+        try {
+            // Search in common directories
+            val searchDirs = listOf(
+                System.getProperty("java.io.tmpdir"),
+                System.getProperty("user.home"),
+                "/tmp",
+                "/var/tmp"
             )
-
-        val linkFile = File(linkPath)
-        val targetFile = File(targetPath)
-
-        // Check if target exists
-        if (!targetFile.exists()) {
-            return DirectorResult(
-                success = false,
-                message = "Symlink target does not exist: $targetPath",
-                level = SecurityLevel.WARNING,
-                details = mapOf("target" to targetPath, "link" to linkPath)
-            )
-        }
-
-        // Check if target is within allowed directories
-        val targetCanonical = try {
-            targetFile.canonicalPath
+            
+            searchDirs.forEach { dirPath ->
+                val dir = File(dirPath)
+                if (dir.exists() && dir.isDirectory) {
+                    dir.walk()
+                        .take(1000) // Limit for performance
+                        .filter { Files.isSymbolicLink(it.toPath()) }
+                        .forEach { symlink ->
+                            val validation = validateSymlink(symlink.absolutePath)
+                            if (!validation.isValid) {
+                                maliciousLinks.add("${symlink.absolutePath}: ${validation.reason}")
+                                suspiciousSymlinks.add(symlink.absolutePath)
+                            }
+                        }
+                }
+            }
         } catch (e: Exception) {
-            return DirectorResult(
-                success = false,
-                message = "Cannot resolve target canonical path: ${e.message}",
-                level = SecurityLevel.ERROR
-            )
+            println("[SymlinkDirector] Error scanning for malicious symlinks: ${e.message}")
         }
-
-        val isAllowed = allowedTargets.any { allowed ->
-            targetCanonical.startsWith(allowed)
-        }
-
-        if (!isAllowed) {
-            return DirectorResult(
-                success = false,
-                message = "Symlink target not in allowed directories: $targetCanonical",
-                level = SecurityLevel.CRITICAL,
-                details = mapOf(
-                    "target" to targetCanonical,
-                    "allowed_targets" to allowedTargets
-                )
-            )
-        }
-
-        // Check for potential symlink loops
-        val loopCheck = detectSymlinkLoop(linkPath, targetPath)
-        if (loopCheck.hasLoop) {
-            return DirectorResult(
-                success = false,
-                message = "Potential symlink loop detected",
-                level = SecurityLevel.CRITICAL,
-                details = mapOf(
-                    "loop_path" to loopCheck.loopPath,
-                    "depth" to loopCheck.depth
-                )
-            )
-        }
-
-        return DirectorResult(
-            success = true,
-            message = "Symlink creation validated successfully",
-            level = SecurityLevel.INFO,
-            details = mapOf(
-                "link" to linkPath,
-                "target" to targetCanonical,
-                "checks_passed" to listOf("target_exists", "allowed_directory", "no_loops")
-            )
-        )
+        
+        return maliciousLinks
     }
-
-    /**
-     * Validate symlink following operation
-     */
-    private fun validateSymlinkFollow(symlinkPath: String): DirectorResult {
-        val cacheKey = symlinkPath
-        val cached = symlinkCache[cacheKey]
+    
+    private fun detectSymlinkLoops(): List<String> {
+        val loops = mutableListOf<String>()
+        val visited = mutableSetOf<String>()
         
-        // Return cached result if still valid
-        if (cached != null && !cached.isExpired()) {
-            return DirectorResult(
-                success = cached.isValid,
-                message = if (cached.isValid) "Symlink follow allowed (cached)" else "Symlink follow denied (cached)",
-                level = if (cached.isValid) SecurityLevel.INFO else SecurityLevel.WARNING,
-                details = mapOf("cached" to true, "resolved_path" to cached.resolvedPath)
-            )
-        }
-
-        val symlinkFile = File(symlinkPath)
-        
-        if (!Files.isSymbolicLink(symlinkFile.toPath())) {
-            return DirectorResult(
-                success = true,
-                message = "Path is not a symlink, allowing access",
-                level = SecurityLevel.INFO
-            )
-        }
-
-        val resolution = resolveSymlinkSafely(symlinkPath)
-        
-        // Cache the result
-        symlinkCache[cacheKey] = CachedSymlinkInfo(
-            resolvedPath = resolution.finalPath,
-            isValid = resolution.isValid,
-            timestamp = System.currentTimeMillis()
-        )
-
-        // Clean cache if too large
-        if (symlinkCache.size > MAX_CACHE_SIZE) {
-            cleanupExpiredCache()
-        }
-
-        return DirectorResult(
-            success = resolution.isValid,
-            message = resolution.message,
-            level = if (resolution.isValid) SecurityLevel.INFO else SecurityLevel.WARNING,
-            details = mapOf(
-                "resolved_path" to resolution.finalPath,
-                "resolution_depth" to resolution.depth,
-                "cached" to false
-            )
-        )
-    }
-
-    /**
-     * Validate general path access (checking for symlinks in path)
-     */
-    private fun validatePath(path: String): DirectorResult {
-        val pathFile = File(path)
-        val pathComponents = mutableListOf<String>()
-        var currentPath = pathFile
-        
-        // Build path components from leaf to root
-        while (currentPath.parent != null) {
-            pathComponents.add(0, currentPath.name)
-            currentPath = currentPath.parentFile
-        }
-        
-        // Check each component for symlinks
-        var buildPath = if (pathFile.isAbsolute) "/" else ""
-        for (component in pathComponents) {
-            buildPath = File(buildPath, component).path
-            val componentFile = File(buildPath)
-            
-            if (Files.isSymbolicLink(componentFile.toPath())) {
-                val validation = validateSymlinkFollow(buildPath)
-                if (!validation.success) {
-                    return DirectorResult(
-                        success = false,
-                        message = "Path contains unsafe symlink at: $buildPath",
-                        level = SecurityLevel.WARNING,
-                        details = mapOf(
-                            "full_path" to path,
-                            "symlink_at" to buildPath,
-                            "validation_error" to validation.message
-                        )
-                    )
-                }
-            }
-        }
-
-        return DirectorResult(
-            success = true,
-            message = "Path validation successful",
-            level = SecurityLevel.INFO,
-            details = mapOf("validated_path" to path)
-        )
-    }
-
-    /**
-     * Safely resolve a symlink with depth and security checks
-     */
-    private fun resolveSymlinkSafely(symlinkPath: String): SymlinkResolution {
-        var currentPath = symlinkPath
-        val visitedPaths = mutableSetOf<String>()
-        var depth = 0
-
-        while (depth < maxDepth) {
-            val currentFile = File(currentPath)
-            
-            // Check for loops
-            if (visitedPaths.contains(currentPath)) {
-                return SymlinkResolution(
-                    finalPath = currentPath,
-                    isValid = false,
-                    message = "Symlink loop detected at depth $depth",
-                    depth = depth
-                )
-            }
-            
-            visitedPaths.add(currentPath)
-            
-            if (!Files.isSymbolicLink(currentFile.toPath())) {
-                // Check if final target is in allowed directories
-                val canonicalPath = try {
-                    currentFile.canonicalPath
-                } catch (e: Exception) {
-                    return SymlinkResolution(
-                        finalPath = currentPath,
-                        isValid = false,
-                        message = "Cannot resolve canonical path: ${e.message}",
-                        depth = depth
-                    )
-                }
-                
-                val isAllowed = allowedTargets.any { allowed ->
-                    canonicalPath.startsWith(allowed)
-                } || allowedTargets.contains("*") // Allow wildcard
-                
-                return SymlinkResolution(
-                    finalPath = canonicalPath,
-                    isValid = isAllowed,
-                    message = if (isAllowed) "Symlink resolved successfully" 
-                             else "Symlink target not in allowed directories",
-                    depth = depth
-                )
-            }
-
-            // Follow the symlink
+        suspiciousSymlinks.forEach { symlinkPath ->
             try {
-                currentPath = Files.readSymbolicLink(currentFile.toPath()).toString()
-                if (!File(currentPath).isAbsolute) {
-                    // Handle relative symlinks
-                    currentPath = File(currentFile.parentFile, currentPath).path
+                val path = Paths.get(symlinkPath)
+                if (Files.isSymbolicLink(path)) {
+                    if (hasSymlinkLoop(path, visited)) {
+                        loops.add(symlinkPath)
+                    }
                 }
             } catch (e: Exception) {
-                return SymlinkResolution(
-                    finalPath = currentPath,
-                    isValid = false,
-                    message = "Failed to read symlink: ${e.message}",
-                    depth = depth
-                )
+                // Skip problematic symlinks
             }
-            
-            depth++
         }
-
-        return SymlinkResolution(
-            finalPath = currentPath,
-            isValid = false,
-            message = "Maximum symlink resolution depth exceeded ($maxDepth)",
-            depth = depth
-        )
-    }
-
-    /**
-     * Detect potential symlink loops before creation
-     */
-    private fun detectSymlinkLoop(linkPath: String, targetPath: String): LoopDetectionResult {
-        val linkParent = File(linkPath).parentFile?.canonicalPath ?: return LoopDetectionResult(false, "", 0)
-        val targetCanonical = try {
-            File(targetPath).canonicalPath
-        } catch (e: Exception) {
-            return LoopDetectionResult(true, "Cannot resolve target path", 0)
-        }
-
-        // Simple check: if target is a parent of link location, could create loop
-        if (linkParent.startsWith(targetCanonical)) {
-            return LoopDetectionResult(
-                true, 
-                "$linkParent would create loop with $targetCanonical", 
-                1
-            )
-        }
-
-        return LoopDetectionResult(false, "", 0)
-    }
-
-    /**
-     * Clean up expired cache entries
-     */
-    private fun cleanupExpiredCache() {
-        val now = System.currentTimeMillis()
-        val expired = symlinkCache.entries.filter { 
-            it.value.timestamp + CACHE_TTL_MS < now
-        }
-        expired.forEach { symlinkCache.remove(it.key) }
         
-        if (expired.isNotEmpty()) {
-            println("Cleaned up ${expired.size} expired symlink cache entries")
+        return loops
+    }
+    
+    private fun findExcessivelyDeepSymlinks(): List<String> {
+        val deepLinks = mutableListOf<String>()
+        
+        suspiciousSymlinks.forEach { symlinkPath ->
+            try {
+                val path = Paths.get(symlinkPath)
+                val depth = calculateSymlinkDepth(path)
+                if (depth > maxSymlinkDepth) {
+                    deepLinks.add("$symlinkPath (depth: $depth)")
+                }
+            } catch (e: Exception) {
+                // Skip problematic symlinks
+            }
+        }
+        
+        return deepLinks
+    }
+    
+    private fun detectPoisonPillFiles(): List<String> {
+        val poisonPills = mutableListOf<String>()
+        
+        // Look for files with suspicious names that might be poison pills
+        val suspiciousPatterns = listOf(
+            Regex(".*\\.\\.(\\\\|/).*"), // Directory traversal
+            Regex(".*[<>:\"|?*].*"),     // Invalid filename characters
+            Regex(".*\\x00.*"),          // Null byte injection
+            Regex(".*(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\\..*)?", RegexOption.IGNORE_CASE) // Windows reserved names
+        )
+        
+        try {
+            val searchDirs = listOf(
+                System.getProperty("java.io.tmpdir"),
+                System.getProperty("user.home"),
+                "/tmp"
+            )
+            
+            searchDirs.forEach { dirPath ->
+                val dir = File(dirPath)
+                if (dir.exists() && dir.isDirectory) {
+                    dir.walk()
+                        .take(500) // Limit for performance
+                        .filter { it.isFile }
+                        .forEach { file ->
+                            val fileName = file.name
+                            if (suspiciousPatterns.any { it.matches(fileName) }) {
+                                poisonPills.add(file.absolutePath)
+                            }
+                        }
+                }
+            }
+        } catch (e: Exception) {
+            println("[SymlinkDirector] Error detecting poison pills: ${e.message}")
+        }
+        
+        return poisonPills
+    }
+    
+    private fun containsDirectoryTraversal(path: String): Boolean {
+        return path.contains("../") || path.contains("..\\") || 
+               path.contains("./") || path.contains(".\\")
+    }
+    
+    private fun isTargetingProtectedPath(targetPath: String): Boolean {
+        return protectedPaths.any { protectedPath ->
+            targetPath.startsWith(protectedPath) || 
+            targetPath.contains(protectedPath)
         }
     }
-
+    
+    private fun isTargetAllowed(targetPath: String): Boolean {
+        if (allowedTargets.isEmpty()) return true
+        
+        return allowedTargets.any { pattern ->
+            targetPath.matches(Regex(pattern)) || targetPath.startsWith(pattern)
+        }
+    }
+    
+    private fun calculateSymlinkDepth(path: Path): Int {
+        var depth = 0
+        var currentPath = path
+        val visited = mutableSetOf<Path>()
+        
+        while (Files.isSymbolicLink(currentPath) && depth < 20) { // Max 20 to prevent infinite loops
+            if (currentPath in visited) break // Loop detected
+            visited.add(currentPath)
+            
+            try {
+                val target = Files.readSymbolicLink(currentPath)
+                currentPath = if (target.isAbsolute) {
+                    target
+                } else {
+                    currentPath.resolveSibling(target).normalize()
+                }
+                depth++
+            } catch (e: Exception) {
+                break
+            }
+        }
+        
+        return depth
+    }
+    
+    private fun hasSymlinkLoop(path: Path, globalVisited: MutableSet<String>): Boolean {
+        val localVisited = mutableSetOf<Path>()
+        var currentPath = path
+        
+        while (Files.isSymbolicLink(currentPath)) {
+            if (currentPath in localVisited) {
+                return true // Loop detected
+            }
+            localVisited.add(currentPath)
+            
+            try {
+                val target = Files.readSymbolicLink(currentPath)
+                currentPath = if (target.isAbsolute) {
+                    target
+                } else {
+                    currentPath.resolveSibling(target).normalize()
+                }
+            } catch (e: Exception) {
+                break
+            }
+        }
+        
+        return false
+    }
+    
     /**
-     * Get current statistics
+     * Result of symlink validation
      */
-    fun getStats(): Map<String, Any> {
-        return mapOf(
-            "cache_size" to symlinkCache.size,
-            "max_depth" to maxDepth,
-            "allowed_targets" to allowedTargets,
-            "cache_ttl_ms" to CACHE_TTL_MS
-        )
-    }
-}
-
-/**
- * Result of symlink resolution
- */
-data class SymlinkResolution(
-    val finalPath: String,
-    val isValid: Boolean,
-    val message: String,
-    val depth: Int
-)
-
-/**
- * Result of symlink loop detection
- */
-data class LoopDetectionResult(
-    val hasLoop: Boolean,
-    val loopPath: String,
-    val depth: Int
-)
-
-/**
- * Cached symlink information
- */
-data class CachedSymlinkInfo(
-    val resolvedPath: String,
-    val isValid: Boolean,
-    val timestamp: Long
-) {
-    fun isExpired(ttlMs: Long = SymlinkDirector.CACHE_TTL_MS): Boolean {
-        return System.currentTimeMillis() - timestamp > ttlMs
-    }
+    data class ValidationResult(
+        val isValid: Boolean,
+        val reason: String
+    )
 }

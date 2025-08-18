@@ -1,584 +1,493 @@
 #!/usr/bin/env python3
 """
-Director responsible for file security, poison pill detection, and malware scanning.
-Provides comprehensive file validation, content analysis, and security quarantine.
+FileSecurityDirector - File integrity and security monitoring
+
+This director provides comprehensive file security monitoring including
+integrity checks, malware detection patterns, suspicious file monitoring,
+and file system security validation.
 """
 
 import os
 import hashlib
-import mimetypes
-import subprocess
-import shutil
-import tempfile
 import time
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from enum import Enum
-from pathlib import Path
-from typing import Dict, List, Optional, Set, Any, Tuple
 import json
-import re
+import stat
+from pathlib import Path
+from typing import Dict, List, Set, Tuple, Optional
+from dataclasses import dataclass
+from enum import Enum
 
 
-class SecurityLevel(Enum):
-    """Security level enumeration"""
-    INFO = "info"
-    WARNING = "warning" 
-    ERROR = "error"
-    CRITICAL = "critical"
-
-
-class ThreatType(Enum):
-    """Types of threats that can be detected"""
-    MALWARE = "malware"
-    POISON_PILL = "poison_pill"
-    SUSPICIOUS_EXTENSION = "suspicious_extension"
-    OVERSIZED_FILE = "oversized_file"
-    HIDDEN_CONTENT = "hidden_content"
-    SCRIPT_INJECTION = "script_injection"
-    EXECUTABLE_DISGUISE = "executable_disguise"
-
-
-@dataclass
-class ScanResult:
-    """Result of a file security scan"""
-    success: bool
-    file_path: str
-    threats: List[ThreatType] = field(default_factory=list)
-    risk_score: int = 0  # 0-100
-    message: str = ""
-    details: Dict[str, Any] = field(default_factory=dict)
-    timestamp: float = field(default_factory=time.time)
-
-
-@dataclass
-class SecurityContext:
-    """Security context for operations"""
-    operation: str
-    target: str
-    user: Optional[str] = None
-    environment: str = "production"
-    metadata: Dict[str, Any] = field(default_factory=dict)
+class Status(Enum):
+    PASS = "PASS"
+    WARN = "WARN"
+    FAIL = "FAIL"
+    ERROR = "ERROR"
 
 
 @dataclass
 class DirectorResult:
-    """Result from a director execution"""
-    success: bool
+    status: Status
     message: str
-    level: SecurityLevel = SecurityLevel.INFO
-    details: Dict[str, Any] = field(default_factory=dict)
-    timestamp: float = field(default_factory=time.time)
+    details: Dict = None
+    
+    def __post_init__(self):
+        if self.details is None:
+            self.details = {}
 
 
 class FileSecurityDirector:
-    """
-    Director responsible for file security and poison pill detection.
-    Provides comprehensive file validation and malware detection capabilities.
-    """
+    """File security monitoring and integrity validation"""
     
     def __init__(self):
-        self.enabled = True
-        self.scan_extensions = {'.exe', '.bat', '.sh', '.py', '.js', '.vbs', '.ps1'}
-        self.quarantine_path = "/tmp/quarantine"
-        self.max_file_size = 100 * 1024 * 1024  # 100MB
-        self.virus_db_path = "/tmp/virus_signatures.db"
-        self.last_run: Optional[float] = None
-        
-        # Initialize threat detection patterns
-        self.poison_pill_patterns = [
-            rb'#!/bin/sh.*rm\s+-rf\s+/',  # Malicious shell scripts
-            rb'eval\s*\(\s*base64_decode',  # PHP code injection
-            rb'<script[^>]*>.*</script>',   # Script injection
-            rb'powershell.*-encodedcommand', # PowerShell attacks
-            rb'cmd\.exe.*\/c.*del',         # Windows deletion commands
-        ]
-        
-        # Known malware signatures (simplified for demo)
-        self.malware_signatures = {
-            "eicar": b'X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*',
-            "test_virus": b'VIRUS-TEST-SIGNATURE-DO-NOT-REMOVE',
+        self.name = "FileSecurityDirector"
+        self.hub = None
+        self.critical_files: Set[str] = set()
+        self.file_hashes: Dict[str, str] = {}
+        self.monitored_directories: Set[str] = set()
+        self.suspicious_extensions: Set[str] = {
+            '.exe', '.scr', '.bat', '.cmd', '.com', '.pif',
+            '.vbs', '.vbe', '.js', '.jse', '.jar', '.ps1'
         }
-
+        self.malware_patterns: List[bytes] = []
+        self.quarantine_dir: Optional[str] = None
+        
     def get_name(self) -> str:
-        return "file_security"
-
-    def initialize(self, config: Dict[str, Any]) -> bool:
-        """Initialize the director with configuration"""
-        try:
-            self.enabled = config.get("enabled", True)
-            self.scan_extensions = set(config.get("scan_extensions", ['.exe', '.bat', '.sh', '.py']))
-            self.quarantine_path = config.get("quarantine_path", "/tmp/quarantine")
-            self.max_file_size = config.get("max_file_size_mb", 100) * 1024 * 1024
-            
-            # Create quarantine directory
-            os.makedirs(self.quarantine_path, exist_ok=True)
-            
-            print(f"FileSecurityDirector initialized - Quarantine: {self.quarantine_path}")
-            return True
-        except Exception as e:
-            print(f"Failed to initialize FileSecurityDirector: {e}")
-            return False
-
-    def is_enabled(self) -> bool:
-        return self.enabled
-
-    def is_applicable(self, context: SecurityContext) -> bool:
-        """Check if this director applies to the given context"""
-        return context.operation in [
-            "file_upload", "file_write", "file_execute", "file_scan",
-            "directory_scan", "malware_check"
-        ]
-
-    def execute(self, context: SecurityContext) -> DirectorResult:
-        """Execute security check based on context"""
-        self.last_run = time.time()
+        return self.name
+    
+    def initialize(self, hub) -> None:
+        """Initialize the director with hub reference"""
+        self.hub = hub
+        
+        # Setup default critical files
+        home_dir = os.path.expanduser("~")
+        self.critical_files.update([
+            "/etc/passwd",
+            "/etc/shadow", 
+            "/etc/hosts",
+            "/etc/sudoers",
+            os.path.join(home_dir, ".ssh/authorized_keys"),
+            os.path.join(home_dir, ".bashrc"),
+            os.path.join(home_dir, ".profile")
+        ])
+        
+        # Setup monitored directories
+        self.monitored_directories.update([
+            "/tmp",
+            "/var/tmp",
+            home_dir,
+            "/usr/local/bin"
+        ])
+        
+        # Initialize quarantine directory
+        self.quarantine_dir = hub.get_config("file_security.quarantine_dir") if hub else None
+        if not self.quarantine_dir:
+            self.quarantine_dir = os.path.join(home_dir, ".quarantine")
+        
+        if not os.path.exists(self.quarantine_dir):
+            os.makedirs(self.quarantine_dir, mode=0o700, exist_ok=True)
+        
+        # Load malware patterns
+        self._load_malware_patterns()
+        
+        # Initialize file hashes for critical files
+        self._initialize_file_hashes()
+        
+        print(f"[{self.name}] Initialized with {len(self.critical_files)} critical files")
+    
+    def perform_security_check(self) -> DirectorResult:
+        """Perform comprehensive file security check"""
+        issues = []
+        details = {}
         
         try:
-            if context.operation == "file_scan":
-                return self._scan_file(context.target)
-            elif context.operation == "directory_scan":
-                return self._scan_directory(context.target)
-            elif context.operation in ["file_upload", "file_write"]:
-                return self._validate_file_operation(context)
-            elif context.operation == "file_execute":
-                return self._validate_execution(context.target)
-            elif context.operation == "malware_check":
-                return self._malware_scan(context.target)
+            # Check critical file integrity
+            integrity_issues = self._check_file_integrity()
+            if integrity_issues:
+                issues.extend(integrity_issues)
+                details["integrity_issues"] = integrity_issues
+            
+            # Scan for suspicious files
+            suspicious_files = self._scan_for_suspicious_files()
+            if suspicious_files:
+                issues.append(f"Found {len(suspicious_files)} suspicious files")
+                details["suspicious_files"] = suspicious_files[:10]  # Limit output
+            
+            # Check for malware patterns
+            malware_matches = self._scan_for_malware_patterns()
+            if malware_matches:
+                issues.append(f"Detected {len(malware_matches)} potential malware files")
+                details["malware_matches"] = malware_matches[:5]
+            
+            # Check file permissions
+            permission_issues = self._check_dangerous_permissions()
+            if permission_issues:
+                issues.extend(permission_issues)
+                details["permission_issues"] = permission_issues[:10]
+            
+            # Check for hidden files in sensitive locations
+            hidden_files = self._scan_for_hidden_files()
+            if hidden_files:
+                issues.append(f"Found {len(hidden_files)} suspicious hidden files")
+                details["hidden_files"] = hidden_files[:10]
+            
+            details.update({
+                "critical_files_checked": len(self.critical_files),
+                "directories_monitored": len(self.monitored_directories),
+                "file_hashes_tracked": len(self.file_hashes)
+            })
+            
+            # Determine overall status
+            if any("malware" in issue.lower() or "integrity" in issue.lower() for issue in issues):
+                return DirectorResult(
+                    Status.FAIL,
+                    f"Critical file security threats detected: {'; '.join(issues[:3])}",
+                    details
+                )
+            elif issues:
+                return DirectorResult(
+                    Status.WARN,
+                    f"File security issues found: {'; '.join(issues[:3])}",
+                    details
+                )
             else:
                 return DirectorResult(
-                    success=True,
-                    message="Operation not applicable to file security director",
-                    level=SecurityLevel.INFO
+                    Status.PASS,
+                    "All file security checks passed",
+                    details
                 )
+                
         except Exception as e:
             return DirectorResult(
-                success=False,
-                message=f"File security check failed: {e}",
-                level=SecurityLevel.ERROR
+                Status.ERROR,
+                f"File security check failed: {str(e)}",
+                {"exception": type(e).__name__}
             )
-
-    def health_check(self) -> bool:
-        """Check if director is healthy"""
-        try:
-            return (
-                self.enabled and
-                os.path.exists(self.quarantine_path) and
-                os.access(self.quarantine_path, os.W_OK)
-            )
-        except Exception:
-            return False
-
-    def get_last_run_time(self) -> Optional[float]:
-        return self.last_run
-
-    def _scan_file(self, file_path: str) -> DirectorResult:
-        """Perform comprehensive file security scan"""
-        if not os.path.exists(file_path):
-            return DirectorResult(
-                success=False,
-                message=f"File not found: {file_path}",
-                level=SecurityLevel.ERROR
-            )
-
-        scan_result = self._perform_security_scan(file_path)
-        
-        if not scan_result.success:
-            # Quarantine suspicious files
-            if scan_result.threats and scan_result.risk_score > 50:
-                quarantined_path = self._quarantine_file(file_path)
-                scan_result.details["quarantined_to"] = quarantined_path
-
-        level = self._determine_security_level(scan_result.risk_score, scan_result.threats)
-        
-        return DirectorResult(
-            success=scan_result.success,
-            message=scan_result.message,
-            level=level,
-            details=scan_result.details
-        )
-
-    def _scan_directory(self, dir_path: str) -> DirectorResult:
-        """Scan entire directory for security threats"""
-        if not os.path.isdir(dir_path):
-            return DirectorResult(
-                success=False,
-                message=f"Directory not found: {dir_path}",
-                level=SecurityLevel.ERROR
-            )
-
-        total_files = 0
-        suspicious_files = 0
-        quarantined_files = []
-        threat_summary = {}
-
-        try:
-            for root, dirs, files in os.walk(dir_path):
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    total_files += 1
-                    
-                    scan_result = self._perform_security_scan(file_path)
-                    
-                    if scan_result.threats:
-                        suspicious_files += 1
-                        
-                        # Count threats
-                        for threat in scan_result.threats:
-                            threat_summary[threat.value] = threat_summary.get(threat.value, 0) + 1
-                        
-                        # Quarantine if high risk
-                        if scan_result.risk_score > 70:
-                            quarantined_path = self._quarantine_file(file_path)
-                            quarantined_files.append({
-                                "original": file_path,
-                                "quarantine": quarantined_path,
-                                "risk_score": scan_result.risk_score
-                            })
-
-            success = suspicious_files == 0 or suspicious_files < total_files * 0.1  # Less than 10%
-            level = SecurityLevel.INFO if success else SecurityLevel.WARNING
-            
-            if quarantined_files:
-                level = SecurityLevel.CRITICAL
-
-            return DirectorResult(
-                success=success,
-                message=f"Directory scan complete: {suspicious_files}/{total_files} files flagged",
-                level=level,
-                details={
-                    "total_files": total_files,
-                    "suspicious_files": suspicious_files,
-                    "quarantined_files": quarantined_files,
-                    "threat_summary": threat_summary
-                }
-            )
-
-        except Exception as e:
-            return DirectorResult(
-                success=False,
-                message=f"Directory scan failed: {e}",
-                level=SecurityLevel.ERROR
-            )
-
-    def _validate_file_operation(self, context: SecurityContext) -> DirectorResult:
-        """Validate file upload or write operation"""
-        file_path = context.target
-        metadata = context.metadata
-
-        # Check file size
+    
+    def add_critical_file(self, file_path: str) -> None:
+        """Add a file to critical files list"""
+        self.critical_files.add(file_path)
         if os.path.exists(file_path):
-            file_size = os.path.getsize(file_path)
-            if file_size > self.max_file_size:
-                return DirectorResult(
-                    success=False,
-                    message=f"File too large: {file_size} bytes (max: {self.max_file_size})",
-                    level=SecurityLevel.WARNING,
-                    details={"file_size": file_size, "max_size": self.max_file_size}
-                )
-
-        # Check file extension
-        _, ext = os.path.splitext(file_path)
-        if ext.lower() in self.scan_extensions:
-            scan_result = self._perform_security_scan(file_path)
-            
-            if scan_result.threats:
-                return DirectorResult(
-                    success=False,
-                    message=f"Security threats detected in file: {scan_result.message}",
-                    level=SecurityLevel.CRITICAL,
-                    details=scan_result.details
-                )
-
-        return DirectorResult(
-            success=True,
-            message="File operation validated",
-            level=SecurityLevel.INFO
-        )
-
-    def _validate_execution(self, file_path: str) -> DirectorResult:
-        """Validate file execution request"""
-        if not os.path.exists(file_path):
-            return DirectorResult(
-                success=False,
-                message=f"Executable not found: {file_path}",
-                level=SecurityLevel.ERROR
-            )
-
-        # Always scan executables before allowing execution
-        scan_result = self._perform_security_scan(file_path)
-        
-        if scan_result.threats:
-            # Quarantine malicious executables immediately
-            quarantined_path = self._quarantine_file(file_path)
-            
-            return DirectorResult(
-                success=False,
-                message=f"Execution blocked - malicious file quarantined",
-                level=SecurityLevel.CRITICAL,
-                details={
-                    "threats": [t.value for t in scan_result.threats],
-                    "quarantined_to": quarantined_path,
-                    "risk_score": scan_result.risk_score
-                }
-            )
-
-        return DirectorResult(
-            success=True,
-            message="Executable validation passed",
-            level=SecurityLevel.INFO,
-            details={"risk_score": scan_result.risk_score}
-        )
-
-    def _malware_scan(self, file_path: str) -> DirectorResult:
-        """Dedicated malware scanning"""
-        scan_result = self._perform_security_scan(file_path)
-        
-        malware_threats = [t for t in scan_result.threats if t in [ThreatType.MALWARE, ThreatType.POISON_PILL]]
-        
-        if malware_threats:
-            return DirectorResult(
-                success=False,
-                message=f"Malware detected: {[t.value for t in malware_threats]}",
-                level=SecurityLevel.CRITICAL,
-                details=scan_result.details
-            )
-
-        return DirectorResult(
-            success=True,
-            message="No malware detected",
-            level=SecurityLevel.INFO,
-            details={"risk_score": scan_result.risk_score}
-        )
-
-    def _perform_security_scan(self, file_path: str) -> ScanResult:
-        """Perform comprehensive security scan on a file"""
-        threats = []
-        risk_score = 0
-        details = {}
-
+            self.file_hashes[file_path] = self._calculate_file_hash(file_path)
+    
+    def remove_critical_file(self, file_path: str) -> None:
+        """Remove a file from critical files list"""
+        self.critical_files.discard(file_path)
+        self.file_hashes.pop(file_path, None)
+    
+    def add_monitored_directory(self, dir_path: str) -> None:
+        """Add a directory to monitor"""
+        self.monitored_directories.add(dir_path)
+    
+    def quarantine_file(self, file_path: str) -> bool:
+        """Move a suspicious file to quarantine"""
         try:
-            # Basic file info
-            file_stat = os.stat(file_path)
-            file_size = file_stat.st_size
-            details["file_size"] = file_size
-            details["file_mode"] = oct(file_stat.st_mode)
-
-            # MIME type detection
-            mime_type, _ = mimetypes.guess_type(file_path)
-            details["mime_type"] = mime_type
-
-            # Read file content (limited for large files)
-            content = b""
-            try:
-                with open(file_path, "rb") as f:
-                    content = f.read(min(file_size, 1024 * 1024))  # Read max 1MB
-            except Exception as e:
-                details["read_error"] = str(e)
-                risk_score += 10
-
-            # Check file extension
-            _, ext = os.path.splitext(file_path)
-            if ext.lower() in {'.exe', '.bat', '.com', '.scr', '.vbs'}:
-                threats.append(ThreatType.SUSPICIOUS_EXTENSION)
-                risk_score += 20
-
-            # Check for oversized files
-            if file_size > self.max_file_size:
-                threats.append(ThreatType.OVERSIZED_FILE)
-                risk_score += 15
-
-            # Check for hidden files or disguised extensions
-            filename = os.path.basename(file_path)
-            if filename.startswith('.') or filename.count('.') > 2:
-                threats.append(ThreatType.HIDDEN_CONTENT)
-                risk_score += 10
-
-            # Poison pill detection
-            poison_detected = self._detect_poison_pills(content)
-            if poison_detected:
-                threats.append(ThreatType.POISON_PILL)
-                risk_score += 40
-                details["poison_patterns"] = poison_detected
-
-            # Malware signature detection
-            malware_detected = self._detect_malware_signatures(content)
-            if malware_detected:
-                threats.append(ThreatType.MALWARE)
-                risk_score += 50
-                details["malware_signatures"] = malware_detected
-
-            # Script injection detection
-            script_threats = self._detect_script_injection(content)
-            if script_threats:
-                threats.append(ThreatType.SCRIPT_INJECTION)
-                risk_score += 30
-                details["script_threats"] = script_threats
-
-            # Executable disguise detection
-            if self._is_executable_disguised(file_path, content, mime_type):
-                threats.append(ThreatType.EXECUTABLE_DISGUISE)
-                risk_score += 25
-
-            # Calculate final risk score
-            risk_score = min(risk_score, 100)
-            details["risk_score"] = risk_score
-
-            success = len(threats) == 0 or risk_score < 30
-            message = f"File scan {'passed' if success else 'failed'} - Risk score: {risk_score}"
+            if not os.path.exists(file_path):
+                return False
             
-            if threats:
-                message += f" - Threats: {[t.value for t in threats]}"
-
-            return ScanResult(
-                success=success,
-                file_path=file_path,
-                threats=threats,
-                risk_score=risk_score,
-                message=message,
-                details=details
-            )
-
-        except Exception as e:
-            return ScanResult(
-                success=False,
-                file_path=file_path,
-                threats=[],
-                risk_score=100,
-                message=f"Scan error: {e}",
-                details={"error": str(e)}
-            )
-
-    def _detect_poison_pills(self, content: bytes) -> List[str]:
-        """Detect poison pill patterns in file content"""
-        detected = []
-        
-        for i, pattern in enumerate(self.poison_pill_patterns):
-            if re.search(pattern, content, re.IGNORECASE):
-                detected.append(f"poison_pattern_{i}")
-        
-        return detected
-
-    def _detect_malware_signatures(self, content: bytes) -> List[str]:
-        """Detect known malware signatures"""
-        detected = []
-        
-        for name, signature in self.malware_signatures.items():
-            if signature in content:
-                detected.append(name)
-        
-        return detected
-
-    def _detect_script_injection(self, content: bytes) -> List[str]:
-        """Detect script injection attempts"""
-        detected = []
-        
-        # Common script injection patterns
-        patterns = [
-            rb'<script[^>]*>.*javascript:',
-            rb'eval\s*\(',
-            rb'document\.write\s*\(',
-            rb'innerHTML\s*=',
-            rb'on\w+\s*=\s*["\'][^"\']*["\']'  # Event handlers
-        ]
-        
-        for i, pattern in enumerate(patterns):
-            if re.search(pattern, content, re.IGNORECASE | re.DOTALL):
-                detected.append(f"script_injection_{i}")
-        
-        return detected
-
-    def _is_executable_disguised(self, file_path: str, content: bytes, mime_type: Optional[str]) -> bool:
-        """Check if file is an executable disguised as another file type"""
-        _, ext = os.path.splitext(file_path)
-        
-        # Check for PE header (Windows executables)
-        if content.startswith(b'MZ') and ext.lower() not in {'.exe', '.dll', '.sys'}:
-            return True
-        
-        # Check for ELF header (Linux executables)
-        if content.startswith(b'\x7fELF') and ext.lower() not in {'.bin', '.so', ''}:
-            return True
-        
-        # Check for shell script in non-script file
-        if content.startswith(b'#!/') and ext.lower() not in {'.sh', '.py', '.pl', '.rb'}:
-            return True
-        
-        return False
-
-    def _quarantine_file(self, file_path: str) -> str:
-        """Move suspicious file to quarantine"""
-        try:
             filename = os.path.basename(file_path)
             timestamp = int(time.time())
-            quarantine_filename = f"{timestamp}_{filename}.quarantined"
-            quarantine_full_path = os.path.join(self.quarantine_path, quarantine_filename)
+            quarantine_path = os.path.join(
+                self.quarantine_dir, 
+                f"{filename}.{timestamp}.quarantined"
+            )
             
-            shutil.move(file_path, quarantine_full_path)
+            # Move file to quarantine
+            os.rename(file_path, quarantine_path)
             
             # Create metadata file
             metadata = {
                 "original_path": file_path,
-                "quarantine_time": timestamp,
-                "reason": "Security threat detected"
+                "quarantined_at": timestamp,
+                "reason": "Suspicious file detected by FileSecurityDirector"
             }
             
-            with open(f"{quarantine_full_path}.meta", 'w') as f:
+            metadata_path = quarantine_path + ".metadata"
+            with open(metadata_path, 'w') as f:
                 json.dump(metadata, f, indent=2)
             
-            print(f"File quarantined: {file_path} -> {quarantine_full_path}")
-            return quarantine_full_path
+            print(f"[{self.name}] Quarantined file: {file_path} -> {quarantine_path}")
+            return True
             
         except Exception as e:
-            print(f"Failed to quarantine file {file_path}: {e}")
-            return file_path
-
-    def _determine_security_level(self, risk_score: int, threats: List[ThreatType]) -> SecurityLevel:
-        """Determine security level based on risk score and threats"""
-        if ThreatType.MALWARE in threats or ThreatType.POISON_PILL in threats:
-            return SecurityLevel.CRITICAL
-        elif risk_score >= 70:
-            return SecurityLevel.ERROR
-        elif risk_score >= 40 or threats:
-            return SecurityLevel.WARNING
-        else:
-            return SecurityLevel.INFO
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Get current statistics"""
-        quarantine_files = []
-        if os.path.exists(self.quarantine_path):
-            quarantine_files = [f for f in os.listdir(self.quarantine_path) 
-                              if f.endswith('.quarantined')]
+            print(f"[{self.name}] Failed to quarantine {file_path}: {e}")
+            return False
+    
+    def _initialize_file_hashes(self) -> None:
+        """Initialize hash database for critical files"""
+        for file_path in self.critical_files:
+            if os.path.exists(file_path):
+                self.file_hashes[file_path] = self._calculate_file_hash(file_path)
+    
+    def _calculate_file_hash(self, file_path: str) -> str:
+        """Calculate SHA256 hash of a file"""
+        try:
+            hash_sha256 = hashlib.sha256()
+            with open(file_path, "rb") as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hash_sha256.update(chunk)
+            return hash_sha256.hexdigest()
+        except Exception as e:
+            print(f"[{self.name}] Error calculating hash for {file_path}: {e}")
+            return ""
+    
+    def _check_file_integrity(self) -> List[str]:
+        """Check integrity of critical files"""
+        issues = []
         
+        for file_path in self.critical_files:
+            if not os.path.exists(file_path):
+                issues.append(f"Critical file missing: {file_path}")
+                continue
+            
+            current_hash = self._calculate_file_hash(file_path)
+            stored_hash = self.file_hashes.get(file_path)
+            
+            if stored_hash and current_hash != stored_hash:
+                issues.append(f"File integrity violation: {file_path}")
+                # Update hash for future checks
+                self.file_hashes[file_path] = current_hash
+            elif not stored_hash:
+                # First time seeing this file
+                self.file_hashes[file_path] = current_hash
+        
+        return issues
+    
+    def _scan_for_suspicious_files(self) -> List[str]:
+        """Scan monitored directories for suspicious files"""
+        suspicious_files = []
+        
+        for dir_path in self.monitored_directories:
+            if not os.path.exists(dir_path):
+                continue
+                
+            try:
+                for root, dirs, files in os.walk(dir_path):
+                    # Limit depth to prevent performance issues
+                    if root.count(os.sep) - dir_path.count(os.sep) > 3:
+                        continue
+                    
+                    for filename in files[:100]:  # Limit files per directory
+                        file_path = os.path.join(root, filename)
+                        
+                        # Check for suspicious extensions
+                        if any(filename.lower().endswith(ext) for ext in self.suspicious_extensions):
+                            suspicious_files.append(f"{file_path} (suspicious extension)")
+                        
+                        # Check for suspicious naming patterns
+                        if self._is_suspicious_filename(filename):
+                            suspicious_files.append(f"{file_path} (suspicious name)")
+                        
+                        # Check file size (very large or very small)
+                        try:
+                            file_size = os.path.getsize(file_path)
+                            if file_size > 100 * 1024 * 1024:  # > 100MB
+                                suspicious_files.append(f"{file_path} (unusually large)")
+                        except OSError:
+                            pass
+            
+            except Exception as e:
+                print(f"[{self.name}] Error scanning {dir_path}: {e}")
+        
+        return suspicious_files
+    
+    def _scan_for_malware_patterns(self) -> List[str]:
+        """Scan files for known malware patterns"""
+        matches = []
+        
+        if not self.malware_patterns:
+            return matches
+        
+        for dir_path in self.monitored_directories:
+            if not os.path.exists(dir_path):
+                continue
+            
+            try:
+                for root, dirs, files in os.walk(dir_path):
+                    if root.count(os.sep) - dir_path.count(os.sep) > 2:  # Limit depth
+                        continue
+                    
+                    for filename in files[:50]:  # Limit files
+                        file_path = os.path.join(root, filename)
+                        
+                        try:
+                            if self._file_contains_malware_pattern(file_path):
+                                matches.append(file_path)
+                        except Exception as e:
+                            pass  # Skip files that can't be read
+            
+            except Exception as e:
+                print(f"[{self.name}] Error scanning for malware in {dir_path}: {e}")
+        
+        return matches
+    
+    def _check_dangerous_permissions(self) -> List[str]:
+        """Check for files with dangerous permissions"""
+        issues = []
+        
+        for dir_path in self.monitored_directories:
+            if not os.path.exists(dir_path):
+                continue
+            
+            try:
+                for root, dirs, files in os.walk(dir_path):
+                    if root.count(os.sep) - dir_path.count(os.sep) > 2:
+                        continue
+                    
+                    for filename in files[:100]:
+                        file_path = os.path.join(root, filename)
+                        
+                        try:
+                            file_stat = os.stat(file_path)
+                            mode = file_stat.st_mode
+                            
+                            # Check for world-writable files
+                            if mode & stat.S_IWOTH:
+                                issues.append(f"World-writable file: {file_path}")
+                            
+                            # Check for executable files in temp directories
+                            if (mode & stat.S_IXUSR) and ("/tmp" in dir_path or "/var/tmp" in dir_path):
+                                issues.append(f"Executable in temp directory: {file_path}")
+                        
+                        except OSError:
+                            pass  # Skip files we can't stat
+            
+            except Exception as e:
+                print(f"[{self.name}] Error checking permissions in {dir_path}: {e}")
+        
+        return issues
+    
+    def _scan_for_hidden_files(self) -> List[str]:
+        """Scan for suspicious hidden files"""
+        hidden_files = []
+        
+        sensitive_dirs = ["/tmp", "/var/tmp", os.path.expanduser("~")]
+        
+        for dir_path in sensitive_dirs:
+            if not os.path.exists(dir_path):
+                continue
+            
+            try:
+                for item in os.listdir(dir_path):
+                    if item.startswith('.') and item not in ['.', '..', '.bashrc', '.profile', '.ssh']:
+                        item_path = os.path.join(dir_path, item)
+                        
+                        # Check if it's a regular file (not directory)
+                        if os.path.isfile(item_path):
+                            # Check if it's recently created or modified
+                            stat_info = os.stat(item_path)
+                            current_time = time.time()
+                            
+                            if (current_time - stat_info.st_mtime) < 86400:  # Modified in last 24 hours
+                                hidden_files.append(item_path)
+            
+            except Exception as e:
+                print(f"[{self.name}] Error scanning hidden files in {dir_path}: {e}")
+        
+        return hidden_files
+    
+    def _is_suspicious_filename(self, filename: str) -> bool:
+        """Check if filename matches suspicious patterns"""
+        suspicious_patterns = [
+            # Common malware naming patterns
+            r'.*\.(exe|scr|bat|cmd)\..*',  # Double extensions
+            r'.*[0-9]{8,}.*',              # Many consecutive digits
+            r'.*\s+\.(exe|scr|bat)',       # Space before extension
+            r'.*[^\w\-\.].*\.(exe|scr)',   # Non-alphanumeric chars
+        ]
+        
+        import re
+        return any(re.match(pattern, filename, re.IGNORECASE) for pattern in suspicious_patterns)
+    
+    def _file_contains_malware_pattern(self, file_path: str) -> bool:
+        """Check if file contains known malware patterns"""
+        try:
+            file_size = os.path.getsize(file_path)
+            if file_size > 10 * 1024 * 1024:  # Skip files larger than 10MB
+                return False
+            
+            with open(file_path, 'rb') as f:
+                content = f.read()
+                
+                for pattern in self.malware_patterns:
+                    if pattern in content:
+                        return True
+            
+            return False
+            
+        except Exception:
+            return False
+    
+    def _load_malware_patterns(self) -> None:
+        """Load known malware patterns"""
+        # Simple example patterns - in production, use proper malware signatures
+        self.malware_patterns = [
+            b'cmd.exe /c',
+            b'powershell -e',
+            b'exec("',
+            b'eval(base64_decode',
+            b'system("rm -rf',
+            b'wget http',
+            b'curl -o /tmp'
+        ]
+    
+    def startup(self) -> None:
+        """Startup hook"""
+        print(f"[{self.name}] Starting file security monitoring")
+        self._initialize_file_hashes()
+    
+    def shutdown(self) -> None:
+        """Shutdown hook"""
+        print(f"[{self.name}] Shutting down file security monitoring")
+        
+        # Save current hashes for next startup
+        hash_file = os.path.join(self.quarantine_dir, "file_hashes.json")
+        try:
+            with open(hash_file, 'w') as f:
+                json.dump(self.file_hashes, f, indent=2)
+        except Exception as e:
+            print(f"[{self.name}] Error saving hashes: {e}")
+
+
+# Integration helpers for the ToolHub system
+class FileSecurityDirectorAdapter:
+    """Adapter to integrate Python director with Kotlin ToolHub"""
+    
+    def __init__(self):
+        self.director = FileSecurityDirector()
+    
+    def initialize(self, config: Dict) -> None:
+        """Initialize with configuration dictionary"""
+        # Simulate ToolHub interface
+        class ConfigHub:
+            def __init__(self, config_dict):
+                self.config = config_dict
+            
+            def get_config(self, key):
+                return self.config.get(key)
+        
+        hub = ConfigHub(config)
+        self.director.initialize(hub)
+    
+    def get_name(self) -> str:
+        return self.director.get_name()
+    
+    def perform_security_check(self) -> Dict:
+        """Perform security check and return result as dictionary"""
+        result = self.director.perform_security_check()
         return {
-            "enabled": self.enabled,
-            "quarantine_path": self.quarantine_path,
-            "quarantined_files": len(quarantine_files),
-            "max_file_size": self.max_file_size,
-            "scan_extensions": list(self.scan_extensions),
-            "last_run": self.last_run
+            "status": result.status.value,
+            "message": result.message,
+            "details": result.details
         }
 
 
-# Example usage and integration
 if __name__ == "__main__":
+    # Test the director
     director = FileSecurityDirector()
-    director.initialize({
-        "enabled": True,
-        "scan_extensions": [".py", ".sh", ".exe"],
-        "quarantine_path": "/tmp/test_quarantine",
-        "max_file_size_mb": 10
-    })
-    
-    # Test with current file
-    context = SecurityContext(
-        operation="file_scan",
-        target=__file__
-    )
-    
-    result = director.execute(context)
-    print(f"Scan result: {result.success}")
+    director.initialize(None)
+    result = director.perform_security_check()
+    print(f"Security Check Result: {result.status.value}")
     print(f"Message: {result.message}")
-    print(f"Level: {result.level}")
-    print(f"Details: {result.details}")
+    if result.details:
+        print("Details:", json.dumps(result.details, indent=2))

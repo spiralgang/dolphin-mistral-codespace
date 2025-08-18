@@ -1,326 +1,273 @@
-package com.spiralgang.dolphin.envdirectors.directors
+package dolphin.mistral.envdirectors.directors
 
-import com.spiralgang.dolphin.envdirectors.*
-import java.security.Principal
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.TimeUnit
+import dolphin.mistral.envdirectors.Director
+import dolphin.mistral.envdirectors.DirectorResult
+import dolphin.mistral.envdirectors.ToolHub
+import java.io.File
+import java.nio.file.Files
+import java.nio.file.Paths
+import java.nio.file.attribute.PosixFilePermission
 
 /**
- * Director responsible for role-based access control and permission management.
- * Handles user authentication, authorization, and permission caching.
+ * PermissionsDirector manages file system permissions and access control
+ * 
+ * This director monitors and enforces proper file permissions to prevent
+ * unauthorized access, privilege escalation, and security vulnerabilities.
  */
-class PermissionsDirector : Director {
-    private var enabled = true
-    private var strictMode = false
-    private var cacheTtl = 300L // 5 minutes default
-    private val permissionCache = ConcurrentHashMap<String, CachedPermission>()
-    private val roleDefinitions = ConcurrentHashMap<String, Role>()
-    private var lastRun: Long? = null
-
-    companion object {
-        const val ADMIN_ROLE = "admin"
-        const val USER_ROLE = "user"
-        const val GUEST_ROLE = "guest"
-        const val SYSTEM_ROLE = "system"
-    }
-
-    override fun getName(): String = "permissions"
-
-    override fun initialize(config: Map<String, Any>): Boolean {
-        return try {
-            enabled = config["enabled"] as? Boolean ?: true
-            strictMode = config["strict_mode"] as? Boolean ?: false
-            cacheTtl = (config["cache_ttl"] as? Number)?.toLong() ?: 300L
-            
-            // Initialize default roles
-            initializeDefaultRoles()
-            
-            println("PermissionsDirector initialized - Strict mode: $strictMode, Cache TTL: ${cacheTtl}s")
-            true
-        } catch (e: Exception) {
-            println("Failed to initialize PermissionsDirector: ${e.message}")
-            false
-        }
-    }
-
-    override fun isEnabled(): Boolean = enabled
-
-    override fun isApplicable(context: SecurityContext): Boolean {
-        // Permissions apply to most operations, especially file access and system operations
-        return context.operation in listOf(
-            "file_access", "file_write", "file_delete", "system_command", 
-            "network_access", "directory_create", "symlink_create"
-        )
-    }
-
-    override fun execute(context: SecurityContext): DirectorResult {
-        lastRun = System.currentTimeMillis()
+class PermissionsDirector : Director() {
+    
+    private lateinit var hub: ToolHub
+    private val criticalPaths = mutableListOf<String>()
+    private val permissionRules = mutableMapOf<String, Set<PosixFilePermission>>()
+    
+    override fun getName(): String = "PermissionsDirector"
+    
+    override fun initialize(hub: ToolHub) {
+        this.hub = hub
         
-        return try {
-            val user = context.user ?: return DirectorResult(
-                success = false,
-                message = "No user specified in security context",
-                level = SecurityLevel.ERROR
-            )
-
-            val permission = checkPermission(user, context.operation, context.target)
+        // Load default critical paths
+        criticalPaths.addAll(listOf(
+            "/etc/passwd",
+            "/etc/shadow", 
+            "/etc/sudoers",
+            "/root",
+            "/home",
+            System.getProperty("user.home")
+        ))
+        
+        // Load permission rules from config if available
+        val config = hub.getConfig("permissions.rules") as? Map<String, String>
+        config?.forEach { (path, perms) ->
+            permissionRules[path] = parsePermissions(perms)
+        }
+        
+        println("[PermissionsDirector] Initialized with ${criticalPaths.size} critical paths")
+    }
+    
+    override fun performSecurityCheck(): DirectorResult {
+        val issues = mutableListOf<String>()
+        val details = mutableMapOf<String, Any>()
+        
+        try {
+            // Check critical file permissions
+            val permissionIssues = checkCriticalPathPermissions()
+            if (permissionIssues.isNotEmpty()) {
+                issues.addAll(permissionIssues)
+            }
             
-            when (permission.status) {
-                PermissionStatus.GRANTED -> DirectorResult(
-                    success = true,
-                    message = "Permission granted for ${context.operation} on ${context.target}",
-                    level = SecurityLevel.INFO,
-                    details = mapOf(
-                        "user" to user,
-                        "role" to permission.role,
-                        "cached" to permission.fromCache
-                    )
+            // Check for world-writable files
+            val worldWritableFiles = findWorldWritableFiles()
+            if (worldWritableFiles.isNotEmpty()) {
+                issues.add("Found ${worldWritableFiles.size} world-writable files")
+                details["worldWritableFiles"] = worldWritableFiles.take(10) // Limit output
+            }
+            
+            // Check for SUID/SGID binaries
+            val suidFiles = findSuidFiles()
+            if (suidFiles.isNotEmpty()) {
+                details["suidFiles"] = suidFiles.take(10)
+            }
+            
+            details["criticalPathsChecked"] = criticalPaths.size
+            details["rulesApplied"] = permissionRules.size
+            
+            return when {
+                issues.isEmpty() -> DirectorResult(
+                    DirectorResult.Status.PASS, 
+                    "All permission checks passed",
+                    details
                 )
-                PermissionStatus.DENIED -> DirectorResult(
-                    success = false,
-                    message = "Permission denied for ${context.operation} on ${context.target}",
-                    level = if (strictMode) SecurityLevel.CRITICAL else SecurityLevel.WARNING,
-                    details = mapOf(
-                        "user" to user,
-                        "reason" to permission.reason
-                    )
+                issues.size < 5 -> DirectorResult(
+                    DirectorResult.Status.WARN,
+                    "Minor permission issues found: ${issues.joinToString("; ")}",
+                    details
                 )
-                PermissionStatus.UNKNOWN -> DirectorResult(
-                    success = !strictMode,
-                    message = "Permission status unknown - ${if (strictMode) "denied in strict mode" else "allowed with warning"}",
-                    level = SecurityLevel.WARNING,
-                    details = mapOf(
-                        "user" to user,
-                        "strict_mode" to strictMode
-                    )
+                else -> DirectorResult(
+                    DirectorResult.Status.FAIL,
+                    "Critical permission vulnerabilities detected: ${issues.take(3).joinToString("; ")}",
+                    details
                 )
             }
+            
         } catch (e: Exception) {
-            DirectorResult(
-                success = false,
-                message = "Permission check failed: ${e.message}",
-                level = SecurityLevel.ERROR
+            return DirectorResult(
+                DirectorResult.Status.ERROR,
+                "Permission check failed: ${e.message}",
+                mapOf("exception" to e.javaClass.simpleName)
             )
         }
     }
-
-    override fun healthCheck(): Boolean {
+    
+    /**
+     * Add a critical path to monitor
+     */
+    fun addCriticalPath(path: String) {
+        if (path !in criticalPaths) {
+            criticalPaths.add(path)
+        }
+    }
+    
+    /**
+     * Set permission rule for a path
+     */
+    fun setPermissionRule(path: String, permissions: String) {
+        permissionRules[path] = parsePermissions(permissions)
+    }
+    
+    /**
+     * Fix permissions for a specific file or directory
+     */
+    fun fixPermissions(path: String): Boolean {
         return try {
-            // Verify core role definitions exist
-            roleDefinitions.containsKey(ADMIN_ROLE) && 
-            roleDefinitions.containsKey(USER_ROLE) &&
-            permissionCache.size < 10000 // Prevent memory issues
+            val file = File(path)
+            if (!file.exists()) {
+                return false
+            }
+            
+            val permissions = permissionRules[path]
+            if (permissions != null) {
+                Files.setPosixFilePermissions(Paths.get(path), permissions)
+                println("[PermissionsDirector] Fixed permissions for $path")
+                true
+            } else {
+                // Apply default secure permissions
+                val defaultPerms = when {
+                    file.isDirectory -> setOf(
+                        PosixFilePermission.OWNER_READ,
+                        PosixFilePermission.OWNER_WRITE,
+                        PosixFilePermission.OWNER_EXECUTE
+                    )
+                    else -> setOf(
+                        PosixFilePermission.OWNER_READ,
+                        PosixFilePermission.OWNER_WRITE
+                    )
+                }
+                Files.setPosixFilePermissions(Paths.get(path), defaultPerms)
+                true
+            }
         } catch (e: Exception) {
+            println("[PermissionsDirector] Failed to fix permissions for $path: ${e.message}")
             false
         }
     }
-
-    override fun getLastRunTime(): Long? = lastRun
-
-    /**
-     * Check if a user has permission for a specific operation on a target
-     */
-    fun checkPermission(user: String, operation: String, target: String): PermissionResult {
-        val cacheKey = "$user:$operation:$target"
+    
+    private fun checkCriticalPathPermissions(): List<String> {
+        val issues = mutableListOf<String>()
         
-        // Check cache first
-        val cached = permissionCache[cacheKey]
-        if (cached != null && !cached.isExpired()) {
-            return PermissionResult(
-                status = cached.status,
-                role = cached.role,
-                reason = "Cached result",
-                fromCache = true
+        criticalPaths.forEach { path ->
+            try {
+                val file = File(path)
+                if (file.exists()) {
+                    val perms = Files.getPosixFilePermissions(Paths.get(path))
+                    
+                    // Check for dangerous permissions
+                    if (PosixFilePermission.OTHERS_WRITE in perms) {
+                        issues.add("$path is world-writable")
+                    }
+                    
+                    if (PosixFilePermission.OTHERS_READ in perms && path.contains("shadow")) {
+                        issues.add("$path is world-readable")
+                    }
+                    
+                    // Check against configured rules
+                    permissionRules[path]?.let { expectedPerms ->
+                        if (perms != expectedPerms) {
+                            issues.add("$path has incorrect permissions")
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                issues.add("Failed to check permissions for $path: ${e.message}")
+            }
+        }
+        
+        return issues
+    }
+    
+    private fun findWorldWritableFiles(): List<String> {
+        val worldWritable = mutableListOf<String>()
+        
+        try {
+            // Check common directories for world-writable files
+            val searchDirs = listOf("/tmp", "/var/tmp", System.getProperty("user.home"))
+            
+            searchDirs.forEach { dir ->
+                val directory = File(dir)
+                if (directory.exists() && directory.isDirectory) {
+                    directory.walk()
+                        .take(1000) // Limit search to prevent performance issues
+                        .filter { it.isFile }
+                        .forEach { file ->
+                            try {
+                                val perms = Files.getPosixFilePermissions(file.toPath())
+                                if (PosixFilePermission.OTHERS_WRITE in perms) {
+                                    worldWritable.add(file.absolutePath)
+                                }
+                            } catch (e: Exception) {
+                                // Skip files we can't check
+                            }
+                        }
+                }
+            }
+        } catch (e: Exception) {
+            println("[PermissionsDirector] Error searching for world-writable files: ${e.message}")
+        }
+        
+        return worldWritable
+    }
+    
+    private fun findSuidFiles(): List<String> {
+        // This is a simplified implementation
+        // In a real implementation, you'd use system commands or native calls
+        val suidFiles = mutableListOf<String>()
+        
+        try {
+            // Common locations for SUID binaries
+            val commonSuidPaths = listOf(
+                "/usr/bin/sudo",
+                "/usr/bin/su", 
+                "/bin/ping",
+                "/usr/bin/passwd"
             )
+            
+            commonSuidPaths.forEach { path ->
+                val file = File(path)
+                if (file.exists()) {
+                    // Note: Java doesn't have direct SUID detection
+                    // This would need native implementation or system command
+                    suidFiles.add(path)
+                }
+            }
+        } catch (e: Exception) {
+            println("[PermissionsDirector] Error checking SUID files: ${e.message}")
         }
-
-        // Determine user role
-        val userRole = getUserRole(user)
-        val role = roleDefinitions[userRole]
-            ?: return PermissionResult(
-                status = PermissionStatus.UNKNOWN,
-                role = userRole,
-                reason = "Unknown role: $userRole"
-            )
-
-        // Check permission
-        val status = when {
-            role.hasPermission(operation, target) -> PermissionStatus.GRANTED
-            role.isDenied(operation, target) -> PermissionStatus.DENIED
-            else -> PermissionStatus.UNKNOWN
-        }
-
-        val result = PermissionResult(
-            status = status,
-            role = userRole,
-            reason = "Role-based check",
-            fromCache = false
-        )
-
-        // Cache result
-        permissionCache[cacheKey] = CachedPermission(
-            status = status,
-            role = userRole,
-            timestamp = System.currentTimeMillis()
-        )
-
-        // Cleanup old cache entries periodically
-        if (permissionCache.size > 1000) {
-            cleanupExpiredCache()
-        }
-
-        return result
-    }
-
-    /**
-     * Get user role (simplified implementation - would integrate with actual auth system)
-     */
-    private fun getUserRole(user: String): String {
-        return when {
-            user == "root" || user == "admin" -> ADMIN_ROLE
-            user == "system" -> SYSTEM_ROLE
-            user == "guest" || user == "anonymous" -> GUEST_ROLE
-            else -> USER_ROLE
-        }
-    }
-
-    /**
-     * Initialize default role definitions
-     */
-    private fun initializeDefaultRoles() {
-        // Admin role - full access
-        roleDefinitions[ADMIN_ROLE] = Role(
-            name = ADMIN_ROLE,
-            permissions = mutableSetOf("*"),
-            denials = mutableSetOf()
-        )
-
-        // User role - limited access
-        roleDefinitions[USER_ROLE] = Role(
-            name = USER_ROLE,
-            permissions = mutableSetOf(
-                "file_access", "file_write", "directory_create", 
-                "network_access"
-            ),
-            denials = mutableSetOf("system_command", "file_delete")
-        )
-
-        // Guest role - read-only access
-        roleDefinitions[GUEST_ROLE] = Role(
-            name = GUEST_ROLE,
-            permissions = mutableSetOf("file_access"),
-            denials = mutableSetOf(
-                "file_write", "file_delete", "system_command", 
-                "directory_create", "symlink_create"
-            )
-        )
-
-        // System role - system operations only
-        roleDefinitions[SYSTEM_ROLE] = Role(
-            name = SYSTEM_ROLE,
-            permissions = mutableSetOf(
-                "system_command", "file_access", "file_write", 
-                "directory_create"
-            ),
-            denials = mutableSetOf("network_access")
-        )
-    }
-
-    /**
-     * Clean up expired cache entries
-     */
-    private fun cleanupExpiredCache() {
-        val now = System.currentTimeMillis()
-        val expired = permissionCache.entries.filter { 
-            it.value.timestamp + TimeUnit.SECONDS.toMillis(cacheTtl) < now
-        }
-        expired.forEach { permissionCache.remove(it.key) }
         
-        if (expired.isNotEmpty()) {
-            println("Cleaned up ${expired.size} expired permission cache entries")
+        return suidFiles
+    }
+    
+    private fun parsePermissions(permString: String): Set<PosixFilePermission> {
+        val permissions = mutableSetOf<PosixFilePermission>()
+        
+        // Simple octal parsing (e.g., "755" or "rwxr-xr-x")
+        if (permString.matches(Regex("\\d{3}"))) {
+            val octal = permString.toInt(8)
+            
+            // Owner permissions
+            if ((octal and 0o400) != 0) permissions.add(PosixFilePermission.OWNER_READ)
+            if ((octal and 0o200) != 0) permissions.add(PosixFilePermission.OWNER_WRITE)
+            if ((octal and 0o100) != 0) permissions.add(PosixFilePermission.OWNER_EXECUTE)
+            
+            // Group permissions
+            if ((octal and 0o040) != 0) permissions.add(PosixFilePermission.GROUP_READ)
+            if ((octal and 0o020) != 0) permissions.add(PosixFilePermission.GROUP_WRITE)
+            if ((octal and 0o010) != 0) permissions.add(PosixFilePermission.GROUP_EXECUTE)
+            
+            // Others permissions
+            if ((octal and 0o004) != 0) permissions.add(PosixFilePermission.OTHERS_READ)
+            if ((octal and 0o002) != 0) permissions.add(PosixFilePermission.OTHERS_WRITE)
+            if ((octal and 0o001) != 0) permissions.add(PosixFilePermission.OTHERS_EXECUTE)
         }
-    }
-
-    /**
-     * Add or update a role definition
-     */
-    fun defineRole(role: Role) {
-        roleDefinitions[role.name] = role
-        // Invalidate related cache entries
-        permissionCache.clear()
-        println("Role definition updated: ${role.name}")
-    }
-
-    /**
-     * Get current cache statistics
-     */
-    fun getCacheStats(): Map<String, Any> {
-        return mapOf(
-            "cache_size" to permissionCache.size,
-            "cache_ttl" to cacheTtl,
-            "roles_defined" to roleDefinitions.size
-        )
-    }
-}
-
-/**
- * Represents a user role with permissions and denials
- */
-data class Role(
-    val name: String,
-    val permissions: MutableSet<String> = mutableSetOf(),
-    val denials: MutableSet<String> = mutableSetOf()
-) {
-    fun hasPermission(operation: String, target: String): Boolean {
-        // Check for explicit denials first
-        if (isDenied(operation, target)) return false
         
-        // Check for wildcard permission
-        if (permissions.contains("*")) return true
-        
-        // Check for specific permission
-        return permissions.contains(operation)
-    }
-
-    fun isDenied(operation: String, target: String): Boolean {
-        return denials.contains(operation) || denials.contains("*")
-    }
-
-    fun addPermission(permission: String) {
-        permissions.add(permission)
-    }
-
-    fun addDenial(denial: String) {
-        denials.add(denial)
-    }
-}
-
-/**
- * Result of a permission check
- */
-data class PermissionResult(
-    val status: PermissionStatus,
-    val role: String,
-    val reason: String,
-    val fromCache: Boolean = false
-)
-
-/**
- * Permission status enumeration
- */
-enum class PermissionStatus {
-    GRANTED, DENIED, UNKNOWN
-}
-
-/**
- * Cached permission entry
- */
-data class CachedPermission(
-    val status: PermissionStatus,
-    val role: String,
-    val timestamp: Long
-) {
-    fun isExpired(ttlSeconds: Long = 300): Boolean {
-        return System.currentTimeMillis() - timestamp > TimeUnit.SECONDS.toMillis(ttlSeconds)
+        return permissions
     }
 }
