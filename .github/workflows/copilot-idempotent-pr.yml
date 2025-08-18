@@ -1,0 +1,55 @@
+name: Copilot Idempotent PR Creation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'copilot/fix-*'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  deduplicate-prs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up GitHub CLI
+        uses: cli/cli-action@v2
+
+      - name: Set up Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Ensure idempotent Copilot PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH_NAME: ${{ github.ref_name }}
+          BASE_BRANCH: main
+        run: |
+          set -euo pipefail
+
+          # Check for an existing open PR from this branch to main
+          EXISTING_PR_NUMBER=$(gh pr list --state open --head "$BRANCH_NAME" --base "$BASE_BRANCH" --json number --jq '.[0].number')
+
+          if [[ -n "$EXISTING_PR_NUMBER" ]]; then
+            echo "Open PR #$EXISTING_PR_NUMBER already exists for $BRANCH_NAME → $BASE_BRANCH. Updating branch..."
+            # Push latest commits to branch (if not already up to date)
+            git push origin "$BRANCH_NAME"
+            # Optionally comment on the PR to indicate update
+            gh pr comment "$EXISTING_PR_NUMBER" --body "🔄 Branch \`$BRANCH_NAME\` updated by automation. No duplicate PR opened."
+          else
+            echo "No open PR found for $BRANCH_NAME → $BASE_BRANCH. Creating a new PR."
+            PR_TITLE="Automated Copilot Fix: $BRANCH_NAME → $BASE_BRANCH"
+            PR_BODY="Automated PR created by Copilot. See workflow logs for details."
+            gh pr create --title "$PR_TITLE" --body "$PR_BODY" --base "$BASE_BRANCH" --head "$BRANCH_NAME"
+          fi
+
+      - name: Log PR deduplication
+        run: echo "PR deduplication logic executed. See previous logs for action details."
