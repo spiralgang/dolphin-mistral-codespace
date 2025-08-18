@@ -1,0 +1,70 @@
+name: Auto Merge-Ahead & Prune Copilot Branches
+
+on:
+  schedule:
+    - cron: '0 3 * * *'   # Runs daily at 03:00 UTC
+  workflow_dispatch:
+
+jobs:
+  merge-and-prune:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up GitHub CLI
+        uses: cli/cli-action@v2
+
+      - name: Set up Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch all branches
+        run: git fetch --all --prune
+
+      - name: Merge and prune branches
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          MAIN_BRANCH="main"
+          # List all copilot/fix-* branches
+          mapfile -t BRANCHES < <(git branch -r | grep 'origin/copilot/fix-' | sed 's|origin/||')
+
+          for BRANCH in "${BRANCHES[@]}"; do
+            echo "::group::Processing $BRANCH"
+            git fetch origin "$BRANCH":"$BRANCH" || continue
+
+            # Check status vs main
+            AHEAD=$(git rev-list --left-right --count origin/$MAIN_BRANCH...$BRANCH | awk '{print $2}')
+            BEHIND=$(git rev-list --left-right --count origin/$MAIN_BRANCH...$BRANCH | awk '{print $1}')
+            echo "$BRANCH is $AHEAD ahead and $BEHIND behind $MAIN_BRANCH"
+
+            if [ "$AHEAD" -gt 0 ]; then
+              echo "Merging $BRANCH into $MAIN_BRANCH"
+              git checkout $MAIN_BRANCH
+              git pull origin $MAIN_BRANCH
+              git merge --no-ff $BRANCH -m "Automated merge of $BRANCH (ahead of $MAIN_BRANCH)"
+              git push origin $MAIN_BRANCH
+              # Delete branch after merge
+              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/$BRANCH"
+              echo "$BRANCH merged and deleted."
+            else
+              echo "$BRANCH is not ahead; deleting."
+              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/$BRANCH"
+              echo "$BRANCH deleted."
+            fi
+            echo "::endgroup::"
+          done
+
+          echo "Branch hygiene complete."
+
+      - name: Audit log
+        if: always()
+        run: |
+          echo "See run logs for detailed branch-by-branch actions and decisions."
